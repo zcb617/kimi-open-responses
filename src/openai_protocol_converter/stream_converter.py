@@ -8,6 +8,8 @@ class StreamConverter:
     def __init__(self, response_id: str, model: str):
         self.response_id = response_id
         self.model = model
+        self._tool_calls: dict[int, dict] = {}
+        self._emitted_tool_ids: set[int] = set()
 
     def process_event(self, event_data: str) -> str | None:
         """Process a single chat.completions SSE event.
@@ -27,12 +29,63 @@ class StreamConverter:
             return None
 
         delta = choices[0].get("delta", {})
-        content = delta.get("content", "")
+        content = delta.get("content")
+        tool_calls = delta.get("tool_calls")
 
-        if content is None or content == "":
-            return None
+        # Handle text content
+        if content:
+            return json.dumps({
+                "id": self.response_id,
+                "output": [{"type": "output_text", "text": content}],
+            }, separators=(",", ":"))
 
-        return json.dumps({
-            "id": self.response_id,
-            "output": [{"type": "output_text", "text": content}],
-        }, separators=(",", ":"))
+        # Handle tool_calls
+        if tool_calls:
+            return self._process_tool_call_delta(tool_calls)
+
+        return None
+
+    def _process_tool_call_delta(self, tool_calls: list[dict]) -> str | None:
+        """Accumulate tool call deltas and emit when complete."""
+        for tc in tool_calls:
+            index = tc.get("index", 0)
+
+            if index not in self._tool_calls:
+                self._tool_calls[index] = {
+                    "id": tc.get("id", ""),
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": tc.get("function", {}).get("arguments", ""),
+                }
+            else:
+                existing = self._tool_calls[index]
+                if tc.get("id"):
+                    existing["id"] = tc["id"]
+                func = tc.get("function", {})
+                if func.get("name"):
+                    existing["name"] = func["name"]
+                if func.get("arguments"):
+                    existing["arguments"] += func["arguments"]
+
+            existing = self._tool_calls[index]
+
+            # Only emit when the tool call appears complete:
+            # we have an id, a name, and arguments that end with '}'
+            args = existing["arguments"]
+            if not existing["id"] or not existing["name"] or not args or not args.endswith("}"):
+                continue
+
+            # Emit if this is the first time we've seen this tool call complete
+            if index not in self._emitted_tool_ids:
+                self._emitted_tool_ids.add(index)
+
+            return json.dumps({
+                "id": self.response_id,
+                "output": [{
+                    "type": "output_function_call",
+                    "call_id": existing["id"],
+                    "name": existing["name"],
+                    "arguments": existing["arguments"],
+                }],
+            }, separators=(",", ":"))
+
+        return None
