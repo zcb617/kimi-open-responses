@@ -57,3 +57,104 @@ def test_parameter_mapping():
     assert result["presence_penalty"] == 0.5
     assert result["frequency_penalty"] == 0.3
     assert result["stream"] is True
+
+
+def test_reasoning_effort_medium_to_enabled():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "reasoning": {"effort": "medium"},
+    }
+    result = convert_request(req)
+    assert result["thinking"] == {"type": "enabled"}
+
+
+def test_reasoning_effort_high_to_enabled():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "reasoning": {"effort": "high"},
+    }
+    result = convert_request(req)
+    assert result["thinking"] == {"type": "enabled"}
+
+
+def test_reasoning_effort_low_to_enabled():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "reasoning": {"effort": "low"},
+    }
+    result = convert_request(req)
+    assert result["thinking"] == {"type": "enabled"}
+
+
+def test_reasoning_effort_none_to_disabled():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "reasoning": {"effort": "none"},
+    }
+    result = convert_request(req)
+    assert result["thinking"] == {"type": "disabled"}
+
+
+def test_no_reasoning_no_thinking():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+    }
+    result = convert_request(req)
+    assert "thinking" not in result
+
+
+def test_text_format_json_schema():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "greeting",
+                    "schema": {"type": "object"},
+                },
+            },
+        },
+    }
+    result = convert_request(req)
+    assert result["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "greeting",
+            "schema": {"type": "object"},
+        },
+    }
+
+
+def test_tools_adaptation():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather info",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ],
+    }
+    result = convert_request(req)
+    assert result["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather info",
+                "parameters": {"type": "object"},
+            },
+        },
+    ]
