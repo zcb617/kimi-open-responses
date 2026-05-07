@@ -1,13 +1,4 @@
-import sys
-sys.path.insert(0, "/var/work/kimi-open-responses/src")
-import importlib.util
-spec = importlib.util.spec_from_file_location(
-    "request_converter",
-    "/var/work/kimi-open-responses/src/openai_protocol_converter/request_converter.py",
-)
-request_converter = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(request_converter)
-convert_request = request_converter.convert_request
+from src.openai_protocol_converter.request_converter import convert_request
 
 
 def test_input_string_to_messages():
