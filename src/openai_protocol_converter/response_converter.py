@@ -5,12 +5,31 @@ def convert_response(chat_resp: dict) -> dict:
     """Convert a chat.completions response dict to responses API format."""
     choice = chat_resp["choices"][0]
     message = choice["message"]
-    content = message.get("content", "")
+
+    # Build output content items
+    content_items: list[dict] = []
+
+    if message.get("refusal"):
+        content_items.append({
+            "type": "refusal",
+            "refusal": message["refusal"],
+        })
+    elif message.get("tool_calls"):
+        for tool_call in message["tool_calls"]:
+            content_items.append({
+                "type": "output_function_call",
+                "call_id": tool_call["id"],
+                "name": tool_call["function"]["name"],
+                "arguments": tool_call["function"]["arguments"],
+            })
+    else:
+        content = message.get("content", "") or ""
+        content_items.append({"type": "output_text", "text": content})
 
     output_item: dict = {
         "type": "message",
         "role": message.get("role", "assistant"),
-        "content": [{"type": "output_text", "text": content}],
+        "content": content_items,
     }
 
     # Handle usage mapping

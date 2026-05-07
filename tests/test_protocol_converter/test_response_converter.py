@@ -81,3 +81,116 @@ def test_usage_mapping():
     assert result["usage"]["input_tokens"] == 100
     assert result["usage"]["output_tokens"] == 50
     assert result["usage"]["total_tokens"] == 150
+
+
+def test_tool_calls_conversion():
+    chat_resp = {
+        "id": "chatcmpl-tool",
+        "object": "chat.completion",
+        "created": 1700000003,
+        "model": "kimi-k2.6",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            },
+        ],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35},
+    }
+    result = convert_response(chat_resp)
+    output = result["output"][0]
+    assert output["type"] == "message"
+    assert output["role"] == "assistant"
+    assert len(output["content"]) == 1
+    assert output["content"][0] == {
+        "type": "output_function_call",
+        "call_id": "call_123",
+        "name": "get_weather",
+        "arguments": '{"city": "Beijing"}',
+    }
+
+
+def test_multiple_tool_calls():
+    chat_resp = {
+        "id": "chatcmpl-tools",
+        "object": "chat.completion",
+        "created": 1700000004,
+        "model": "kimi-k2.6",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "get_time",
+                                "arguments": '{"timezone": "UTC"}',
+                            },
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            },
+        ],
+        "usage": {"prompt_tokens": 25, "completion_tokens": 30, "total_tokens": 55},
+    }
+    result = convert_response(chat_resp)
+    content = result["output"][0]["content"]
+    assert len(content) == 2
+    assert content[0]["type"] == "output_function_call"
+    assert content[0]["call_id"] == "call_1"
+    assert content[1]["call_id"] == "call_2"
+
+
+def test_refusal_conversion():
+    chat_resp = {
+        "id": "chatcmpl-refuse",
+        "object": "chat.completion",
+        "created": 1700000005,
+        "model": "kimi-k2.6",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "refusal": "I cannot help with that.",
+                },
+                "finish_reason": "stop",
+            },
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+    }
+    result = convert_response(chat_resp)
+    output = result["output"][0]
+    assert output["type"] == "message"
+    assert len(output["content"]) == 1
+    assert output["content"][0] == {
+        "type": "refusal",
+        "refusal": "I cannot help with that.",
+    }
