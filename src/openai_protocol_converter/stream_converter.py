@@ -33,7 +33,7 @@ class StreamConverter:
         tool_calls = delta.get("tool_calls")
 
         # Handle text content
-        if content:
+        if content is not None:
             return json.dumps({
                 "id": self.response_id,
                 "output": [{"type": "output_text", "text": content}],
@@ -68,13 +68,11 @@ class StreamConverter:
 
             existing = self._tool_calls[index]
 
-            # Only emit when the tool call appears complete:
-            # we have an id, a name, and arguments that end with '}'
-            args = existing["arguments"]
-            if not existing["id"] or not existing["name"] or not args or not args.endswith("}"):
+            # Emit once we have an id and name (minimum viable tool call)
+            if not existing["id"] or not existing["name"]:
                 continue
 
-            # Emit if this is the first time we've seen this tool call complete
+            # Track that we've emitted this tool call
             if index not in self._emitted_tool_ids:
                 self._emitted_tool_ids.add(index)
 
