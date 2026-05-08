@@ -6,7 +6,6 @@ def convert_response(chat_resp: dict) -> dict:
     choice = chat_resp["choices"][0]
     message = choice["message"]
 
-    # Build output content items
     content_items: list[dict] = []
 
     if message.get("refusal"):
@@ -19,6 +18,7 @@ def convert_response(chat_resp: dict) -> dict:
             content_items.append({
                 "type": "output_function_call",
                 "call_id": tool_call["id"],
+                "id": tool_call["id"],
                 "name": tool_call["function"]["name"],
                 "arguments": tool_call["function"]["arguments"],
             })
@@ -32,7 +32,6 @@ def convert_response(chat_resp: dict) -> dict:
         "content": content_items,
     }
 
-    # Handle usage mapping
     usage = chat_resp.get("usage", {})
     mapped_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
