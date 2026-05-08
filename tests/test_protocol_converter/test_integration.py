@@ -1,9 +1,10 @@
 """End-to-end integration tests for the protocol converter."""
+import json
+
 from src.openai_protocol_converter import convert_request, convert_response, StreamConverter
 
 
 def test_full_text_request_response_cycle():
-    # Client sends responses API request
     responses_req = {
         "model": "kimi-k2.6",
         "input": "What is the weather?",
@@ -11,14 +12,12 @@ def test_full_text_request_response_cycle():
         "max_output_tokens": 50,
     }
 
-    # Convert to chat.completions
     chat_req = convert_request(responses_req)
     assert chat_req["model"] == "kimi-k2.6"
     assert chat_req["messages"] == [{"role": "user", "content": "What is the weather?"}]
     assert chat_req["temperature"] == 0.5
     assert chat_req["max_tokens"] == 50
 
-    # Simulate upstream response (chat.completions format)
     chat_resp = {
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -37,7 +36,6 @@ def test_full_text_request_response_cycle():
         "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
     }
 
-    # Convert back to responses API
     responses_resp = convert_response(chat_resp)
     assert responses_resp["id"] == "chatcmpl-test"
     assert responses_resp["object"] == "response"
@@ -57,8 +55,25 @@ def test_streaming_end_to_end():
         "[DONE]",
     ]
 
-    results = [converter.process_event(e) for e in events]
-    assert results[0] == '{"id":"resp-e2e","output":[{"type":"output_text","text":"Thinking"}]}'
-    assert results[1] == '{"id":"resp-e2e","output":[{"type":"output_text","text":"..."}]}'
-    assert results[2] == '{"id":"resp-e2e","output":[{"type":"output_text","text":" Done!"}]}'
-    assert results[3] == '{"id":"resp-e2e","status":"completed"}'
+    results = []
+    for e in events:
+        results.extend(converter.process_event(e))
+
+    parsed = [json.loads(r) for r in results]
+    types = [p["type"] for p in parsed]
+
+    assert types == [
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+
+    assert parsed[1]["delta"] == "Thinking"
+    assert parsed[2]["delta"] == "..."
+    assert parsed[3]["delta"] == " Done!"
+    assert parsed[4]["text"] == "Thinking... Done!"

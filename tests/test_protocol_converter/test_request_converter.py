@@ -133,17 +133,16 @@ def test_text_format_json_schema():
 
 
 def test_tools_adaptation():
+    """Responses API format tools (flat) are converted to Chat Completions format (nested)."""
     req = {
         "model": "kimi-k2.6",
         "input": "Hello!",
         "tools": [
             {
                 "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get weather info",
-                    "parameters": {"type": "object"},
-                },
+                "name": "get_weather",
+                "description": "Get weather info",
+                "parameters": {"type": "object"},
             },
         ],
     }

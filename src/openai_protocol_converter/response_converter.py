@@ -18,7 +18,6 @@ def convert_response(chat_resp: dict) -> dict:
             content_items.append({
                 "type": "output_function_call",
                 "call_id": tool_call["id"],
-                "id": tool_call["id"],
                 "name": tool_call["function"]["name"],
                 "arguments": tool_call["function"]["arguments"],
             })
