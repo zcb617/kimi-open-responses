@@ -40,8 +40,8 @@ class StreamConverter:
         self._preamble_sent = False
         self._in_reasoning = False
         self._reasoning_started = False
-        self._reasoning_text = ""
-        self._text_content = ""
+        self._reasoning_parts: list[str] = []
+        self._text_parts: list[str] = []
         self._tool_calls: dict[int, dict] = {}
         self._emitted_tool_ids: set[int] = set()
         self._emitted_tool_call_items: set[int] = set()
@@ -131,7 +131,7 @@ class StreamConverter:
                     "part": {"type": "reasoning_text", "text": ""},
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
-            self._reasoning_text += reasoning_content
+            self._reasoning_parts.append(reasoning_content)
             events.append(json.dumps({
                 "type": "response.reasoning_text.delta",
                 "item_id": self.item_id,
@@ -151,12 +151,12 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "text": self._reasoning_text,
+                    "text": "".join(self._reasoning_parts),
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
 
             # First actual content: emit content_part.added for output_text
-            if content and not self._text_content:
+            if content and not self._text_parts:
                 events.append(json.dumps({
                     "type": "response.content_part.added",
                     "item_id": self.item_id,
@@ -166,7 +166,7 @@ class StreamConverter:
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
 
-            self._text_content += content
+            self._text_parts.append(content)
             events.append(json.dumps({
                 "type": "response.output_text.delta",
                 "item_id": self.item_id,
@@ -178,6 +178,8 @@ class StreamConverter:
             }, separators=(",", ":")))
 
         if tool_calls:
+            reasoning_text = "".join(self._reasoning_parts)
+            text_content = "".join(self._text_parts)
             # Transition from reasoning to tool_calls: close reasoning first
             if self._in_reasoning:
                 self._in_reasoning = False
@@ -186,17 +188,17 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "text": self._reasoning_text,
+                    "text": reasoning_text,
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
             # Transition from content to tool_calls: close content first
-            if self._text_content and not self._message_done:
+            if text_content and not self._message_done:
                 events.append(json.dumps({
                     "type": "response.output_text.done",
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "text": self._text_content,
+                    "text": text_content,
                     "logprobs": [],
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
@@ -205,7 +207,7 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "part": {"type": "output_text", "text": self._text_content, "annotations": []},
+                    "part": {"type": "output_text", "text": text_content, "annotations": []},
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
                 self._message_done = True
@@ -218,6 +220,9 @@ class StreamConverter:
         if self._completed:
             return
         self._completed = True
+        reasoning_text = "".join(self._reasoning_parts)
+        text_content = "".join(self._text_parts)
+
         # End reasoning if still in progress
         if self._in_reasoning:
             self._in_reasoning = False
@@ -226,27 +231,27 @@ class StreamConverter:
                 "item_id": self.item_id,
                 "output_index": 0,
                 "content_index": 0,
-                "text": self._reasoning_text,
+                "text": reasoning_text,
                 "sequence_number": self._next_seq(),
             }, separators=(",", ":")))
 
         # Build content parts for done events
         content_parts: list[dict] = []
-        if self._reasoning_text:
-            content_parts.append({"type": "reasoning_text", "text": self._reasoning_text})
-        if self._text_content:
-            content_parts.append({"type": "output_text", "text": self._text_content})
+        if reasoning_text:
+            content_parts.append({"type": "reasoning_text", "text": reasoning_text})
+        if text_content:
+            content_parts.append({"type": "output_text", "text": text_content})
 
         # Close message item if not yet done (covers: has content, no content+no tools, no content+has tools)
         if not self._message_done:
-            if self._text_content:
+            if text_content:
                 # output_text.done
                 events.append(json.dumps({
                     "type": "response.output_text.done",
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "text": self._text_content,
+                    "text": text_content,
                     "logprobs": [],
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
@@ -257,7 +262,7 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "part": {"type": "output_text", "text": self._text_content, "annotations": []},
+                    "part": {"type": "output_text", "text": text_content, "annotations": []},
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
             elif not self._tool_calls:
@@ -267,7 +272,7 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "text": self._text_content,
+                    "text": text_content,
                     "logprobs": [],
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
@@ -276,7 +281,7 @@ class StreamConverter:
                     "item_id": self.item_id,
                     "output_index": 0,
                     "content_index": 1,
-                    "part": {"type": "output_text", "text": self._text_content, "annotations": []},
+                    "part": {"type": "output_text", "text": text_content, "annotations": []},
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
 
