@@ -223,3 +223,100 @@ def test_function_call_output_content_parts_coerced_to_text():
     assert result["messages"][0]["role"] == "tool"
     assert result["messages"][0]["tool_call_id"] == "shell_command:145"
     assert result["messages"][0]["content"] == "file.txt"
+
+
+def test_function_call_output_accepts_tool_call_id_field():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {
+                "type": "function_call_output",
+                "tool_call_id": "shell_command:73",
+                "output": "ok",
+            },
+        ],
+    }
+    result = convert_request(req)
+    assert result["messages"][0]["role"] == "tool"
+    assert result["messages"][0]["tool_call_id"] == "shell_command:73"
+    assert result["messages"][0]["content"] == "ok"
+
+
+def test_function_call_accepts_tool_call_id_field():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {
+                "type": "function_call",
+                "tool_call_id": "shell_command:73",
+                "name": "run_shell",
+                "arguments": "{\"cmd\":\"pwd\"}",
+            },
+        ],
+    }
+    result = convert_request(req)
+    assert result["messages"][0]["role"] == "assistant"
+    assert result["messages"][0]["tool_calls"][0]["id"] == "shell_command:73"
+
+
+def test_assistant_tool_calls_without_id_backfilled_from_tool_messages():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "shell_command", "arguments": "{\"cmd\":\"pwd\"}"},
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "shell_command", "arguments": "{\"cmd\":\"ls\"}"},
+                    },
+                ],
+            },
+            {"role": "developer", "content": "keep this as system message"},
+            {"role": "tool", "tool_call_id": "tool_A", "content": "pwd output"},
+            {"role": "tool", "call_id": "tool_B", "content": "ls output"},
+        ],
+    }
+    result = convert_request(req)
+    messages = result["messages"]
+    assert messages[0]["role"] == "assistant"
+    assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["tool_A", "tool_B"]
+    assert messages[1] == {"role": "tool", "tool_call_id": "tool_A", "content": "pwd output"}
+    assert messages[2] == {"role": "tool", "tool_call_id": "tool_B", "content": "ls output"}
+    assert messages[3] == {"role": "system", "content": "keep this as system message"}
+
+
+def test_assistant_tool_calls_mixed_ids_keep_sequence():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "tool_X",
+                        "type": "function",
+                        "function": {"name": "shell_command", "arguments": "{\"cmd\":\"echo x\"}"},
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "shell_command", "arguments": "{\"cmd\":\"echo y\"}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tool_X", "content": "x"},
+            {"role": "tool", "tool_call_id": "tool_Y", "content": "y"},
+        ],
+    }
+    result = convert_request(req)
+    messages = result["messages"]
+    assert messages[0]["role"] == "assistant"
+    assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["tool_X", "tool_Y"]
+    assert messages[1] == {"role": "tool", "tool_call_id": "tool_X", "content": "x"}
+    assert messages[2] == {"role": "tool", "tool_call_id": "tool_Y", "content": "y"}

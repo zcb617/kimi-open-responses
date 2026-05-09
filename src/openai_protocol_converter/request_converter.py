@@ -31,6 +31,114 @@ def _coerce_text_content(content) -> str:
     return str(content)
 
 
+def _normalize_tool_call_sequences(messages: list[dict]) -> list[dict]:
+    """Ensure each assistant tool_calls block is immediately followed by matching tool messages."""
+    non_tool_messages: list[dict] = []
+    tool_messages_by_id: dict[str, list[dict]] = {}
+    tool_messages_in_order: list[dict] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool":
+            tool_call_id = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id", "")
+            if not tool_call_id:
+                continue
+            normalized_tool = dict(msg)
+            normalized_tool["tool_call_id"] = tool_call_id
+            normalized_tool["content"] = _coerce_text_content(normalized_tool.get("content", ""))
+            tool_messages_by_id.setdefault(tool_call_id, []).append(normalized_tool)
+            tool_messages_in_order.append(normalized_tool)
+            continue
+        non_tool_messages.append(msg)
+
+    consumed_tool_ids: set[int] = set()
+    ordered_tool_cursor = 0
+
+    def _mark_consumed(tool_msg: dict):
+        consumed_tool_ids.add(id(tool_msg))
+
+    def _pop_tool_by_id(call_id: str) -> dict | None:
+        queue = tool_messages_by_id.get(call_id)
+        if not queue:
+            return None
+        while queue:
+            candidate = queue.pop(0)
+            if id(candidate) in consumed_tool_ids:
+                continue
+            _mark_consumed(candidate)
+            if not queue:
+                tool_messages_by_id.pop(call_id, None)
+            return candidate
+        tool_messages_by_id.pop(call_id, None)
+        return None
+
+    def _pop_next_tool_in_order() -> dict | None:
+        nonlocal ordered_tool_cursor
+        while ordered_tool_cursor < len(tool_messages_in_order):
+            candidate = tool_messages_in_order[ordered_tool_cursor]
+            ordered_tool_cursor += 1
+            if id(candidate) in consumed_tool_ids:
+                continue
+            _mark_consumed(candidate)
+            return candidate
+        return None
+
+    normalized: list[dict] = []
+    assistant_tool_blocks = 0
+    for msg in non_tool_messages:
+        msg_out = dict(msg)
+        normalized.append(msg_out)
+
+        if msg_out.get("role") != "assistant":
+            continue
+        tool_calls = msg_out.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+        assistant_tool_blocks += 1
+
+        updated_tool_calls = []
+        for idx, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            tc = dict(tool_call)
+            call_id = tc.get("id") or tc.get("call_id") or tc.get("tool_call_id") or ""
+            matched_tool: dict | None = None
+            if call_id:
+                call_id = str(call_id)
+                matched_tool = _pop_tool_by_id(call_id)
+            if not call_id:
+                matched_tool = _pop_next_tool_in_order()
+                if matched_tool is not None:
+                    call_id = matched_tool.get("tool_call_id", "")
+            if not call_id:
+                fn_name = ""
+                function = tc.get("function")
+                if isinstance(function, dict):
+                    fn_name = function.get("name", "")
+                call_id = f"{fn_name or 'tool'}:{idx}"
+            if not matched_tool:
+                matched_tool = _pop_tool_by_id(call_id)
+            tc["id"] = call_id
+            updated_tool_calls.append(tc)
+
+            if matched_tool:
+                normalized.append(matched_tool)
+            else:
+                normalized.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": "",
+                })
+
+        msg_out["tool_calls"] = updated_tool_calls
+
+    if assistant_tool_blocks == 0:
+        return non_tool_messages + tool_messages_in_order
+
+    return normalized
+
+
 def _convert_content_part(part: dict) -> dict | None:
     """Convert a single Responses API content part to Chat Completions format."""
     part_type = part.get("type", "")
@@ -120,9 +228,10 @@ def _convert_message(msg: dict) -> dict | None:
 
     if msg_type == "function_call_output":
         output = _convert_content(msg.get("output", ""))
+        tool_call_id = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id", "")
         return {
             "role": "tool",
-            "tool_call_id": msg.get("call_id") or msg.get("id", ""),
+            "tool_call_id": tool_call_id,
             "content": _coerce_text_content(output),
         }
 
@@ -130,12 +239,13 @@ def _convert_message(msg: dict) -> dict | None:
         reasoning_content = msg.get("reasoning_content", "")
         if not isinstance(reasoning_content, str):
             reasoning_content = ""
+        call_id = msg.get("call_id") or msg.get("tool_call_id") or msg.get("id", "")
         return {
             "role": "assistant",
             "content": None,
             "reasoning_content": reasoning_content,
             "tool_calls": [{
-                "id": msg.get("call_id") or msg.get("id", ""),
+                "id": call_id,
                 "type": "function",
                 "function": {
                     "name": msg.get("name", ""),
@@ -193,7 +303,7 @@ def convert_request(responses_req: dict) -> dict:
                 converted_msgs[-1]["tool_calls"].extend(cm["tool_calls"])
                 continue
             converted_msgs.append(cm)
-        chat_req["messages"] = converted_msgs
+        chat_req["messages"] = _normalize_tool_call_sequences(converted_msgs)
 
     instructions = responses_req.get("instructions")
     if instructions:
