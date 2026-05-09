@@ -124,3 +124,50 @@ def test_tool_call_stream():
     # final arguments.done
     done_event = events[5]
     assert done_event["arguments"] == '{"city":"Beijing"}'
+
+
+def test_finish_chunk_usage_mapped_into_response_completed():
+    converter = StreamConverter(response_id="resp-usage", model="kimi-k2.6")
+
+    finish_with_usage = json.dumps({
+        "id": "chatcmpl-usage",
+        "choices": [{
+            "delta": {},
+            "finish_reason": "stop",
+            "usage": {
+                "prompt_tokens": 123,
+                "completion_tokens": 45,
+                "total_tokens": 168,
+                "cached_tokens": 100,
+            },
+        }],
+    })
+    results = converter.process_event(finish_with_usage)
+    events = _parse_events(results)
+    assert events[-1]["type"] == "response.completed"
+    usage = events[-1]["response"]["usage"]
+    assert usage["input_tokens"] == 123
+    assert usage["output_tokens"] == 45
+    assert usage["total_tokens"] == 168
+    assert usage["input_tokens_details"]["cached_tokens"] == 100
+
+
+def test_usage_only_chunk_updates_converter_usage():
+    converter = StreamConverter(response_id="resp-usage-only", model="kimi-k2.6")
+
+    # Completion may be emitted before a later usage-only chunk.
+    converter.process_event('{"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"stop"}]}')
+    result = converter.process_event(json.dumps({
+        "id": "chatcmpl-1",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+            "prompt_tokens_details": {"cached_tokens": 7},
+        },
+    }))
+    assert result == []
+    assert converter._usage["input_tokens"] == 10
+    assert converter._usage["output_tokens"] == 3
+    assert converter._usage["input_tokens_details"]["cached_tokens"] == 7

@@ -4,6 +4,31 @@ import time
 import uuid
 
 
+def _map_chat_usage_to_responses(chat_usage: dict | None) -> dict | None:
+    """Map chat.completions usage shape to Responses usage shape."""
+    if not isinstance(chat_usage, dict):
+        return None
+    prompt_tokens_details = chat_usage.get("prompt_tokens_details")
+    completion_tokens_details = chat_usage.get("completion_tokens_details")
+    cached_tokens = chat_usage.get("cached_tokens")
+    if cached_tokens is None and isinstance(prompt_tokens_details, dict):
+        cached_tokens = prompt_tokens_details.get("cached_tokens")
+    reasoning_tokens = chat_usage.get("reasoning_tokens")
+    if reasoning_tokens is None and isinstance(completion_tokens_details, dict):
+        reasoning_tokens = completion_tokens_details.get("reasoning_tokens")
+    return {
+        "input_tokens": chat_usage.get("prompt_tokens", 0),
+        "input_tokens_details": {
+            "cached_tokens": cached_tokens or 0,
+        },
+        "output_tokens": chat_usage.get("completion_tokens", 0),
+        "output_tokens_details": {
+            "reasoning_tokens": reasoning_tokens or 0,
+        },
+        "total_tokens": chat_usage.get("total_tokens", 0),
+    }
+
+
 def parse_sse_buffer(buffer: str) -> tuple[list[dict], str]:
     """Parse an SSE buffer, returning (complete events, leftover)."""
     events = []
@@ -55,6 +80,7 @@ class StreamConverter:
         self._next_output_index = 1  # 0 is reserved for the message item
         self._completed = False
         self._message_done = False
+        self._usage: dict | None = None
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -89,7 +115,7 @@ class StreamConverter:
             "tools": [],
             "top_p": 1,
             "truncation": "disabled",
-            "usage": None,
+            "usage": self._usage,
             "user": None,
             "metadata": {},
         }
@@ -135,11 +161,18 @@ class StreamConverter:
         except json.JSONDecodeError:
             return events
 
+        mapped_usage = _map_chat_usage_to_responses(data.get("usage"))
+        if mapped_usage is not None:
+            self._usage = mapped_usage
+
         choices = data.get("choices", [])
         if not choices:
             return events
 
         choice = choices[0]
+        mapped_usage = _map_chat_usage_to_responses(choice.get("usage"))
+        if mapped_usage is not None:
+            self._usage = mapped_usage
         delta = choice.get("delta", {})
         content = delta.get("content")
         reasoning_content = delta.get("reasoning_content")
