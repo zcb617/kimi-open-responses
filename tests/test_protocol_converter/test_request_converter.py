@@ -52,7 +52,7 @@ def test_parameter_mapping():
     }
     result = convert_request(req)
     assert result["temperature"] == 0.7
-    assert result["max_tokens"] == 100
+    assert result["max_completion_tokens"] == 100
     assert result["top_p"] == 0.9
     assert result["presence_penalty"] == 0.5
     assert result["frequency_penalty"] == 0.3
@@ -132,6 +132,30 @@ def test_text_format_json_schema():
     }
 
 
+def test_text_format_openai_style_json_schema_rewritten_for_kimi():
+    req = {
+        "model": "kimi-k2.6",
+        "input": "Hello!",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "greeting",
+                "schema": {"type": "object"},
+                "strict": True,
+            },
+        },
+    }
+    result = convert_request(req)
+    assert result["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "greeting",
+            "schema": {"type": "object"},
+            "strict": True,
+        },
+    }
+
+
 def test_tools_adaptation():
     """Responses API format tools (flat) are converted to Chat Completions format (nested)."""
     req = {
@@ -157,3 +181,15 @@ def test_tools_adaptation():
             },
         },
     ]
+
+
+def test_empty_assistant_message_filtered():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {"role": "assistant", "content": "", "reasoning_content": "hidden chain of thought"},
+            {"role": "user", "content": "Hello!"},
+        ],
+    }
+    result = convert_request(req)
+    assert result["messages"] == [{"role": "user", "content": "Hello!"}]

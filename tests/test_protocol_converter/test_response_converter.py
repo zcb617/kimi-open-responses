@@ -36,6 +36,7 @@ def test_basic_response_conversion():
     assert result["output"][0]["content"][0] == {
         "type": "output_text",
         "text": "Hello! How can I help?",
+        "annotations": [],
     }
 
 
@@ -113,11 +114,11 @@ def test_tool_calls_conversion():
     }
     result = convert_response(chat_resp)
     output = result["output"][0]
-    assert output["type"] == "message"
-    assert output["role"] == "assistant"
-    assert len(output["content"]) == 1
-    assert output["content"][0] == {
-        "type": "output_function_call",
+    assert output["type"] == "function_call"
+    assert output == {
+        "id": "fc_call_123",
+        "type": "function_call",
+        "status": "completed",
         "call_id": "call_123",
         "name": "get_weather",
         "arguments": '{"city": "Beijing"}',
@@ -161,11 +162,12 @@ def test_multiple_tool_calls():
         "usage": {"prompt_tokens": 25, "completion_tokens": 30, "total_tokens": 55},
     }
     result = convert_response(chat_resp)
-    content = result["output"][0]["content"]
-    assert len(content) == 2
-    assert content[0]["type"] == "output_function_call"
-    assert content[0]["call_id"] == "call_1"
-    assert content[1]["call_id"] == "call_2"
+    output = result["output"]
+    assert len(output) == 2
+    assert output[0]["type"] == "function_call"
+    assert output[0]["call_id"] == "call_1"
+    assert output[1]["type"] == "function_call"
+    assert output[1]["call_id"] == "call_2"
 
 
 def test_refusal_conversion():

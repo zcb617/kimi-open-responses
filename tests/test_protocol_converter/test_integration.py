@@ -16,7 +16,7 @@ def test_full_text_request_response_cycle():
     assert chat_req["model"] == "kimi-k2.6"
     assert chat_req["messages"] == [{"role": "user", "content": "What is the weather?"}]
     assert chat_req["temperature"] == 0.5
-    assert chat_req["max_tokens"] == 50
+    assert chat_req["max_completion_tokens"] == 50
 
     chat_resp = {
         "id": "chatcmpl-test",
