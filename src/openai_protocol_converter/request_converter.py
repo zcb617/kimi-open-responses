@@ -7,6 +7,30 @@ _INPUT_IMAGE = "input_image"
 _REFUSAL = "refusal"
 
 
+def _coerce_text_content(content) -> str:
+    """Coerce mixed content shapes to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type", "")
+            if part_type in (_INPUT_TEXT, _OUTPUT_TEXT, "text"):
+                text = part.get("text", "")
+                if isinstance(text, str):
+                    chunks.append(text)
+            elif part_type == _REFUSAL:
+                refusal = part.get("refusal", "")
+                if isinstance(refusal, str):
+                    chunks.append(refusal)
+        return "".join(chunks)
+    return str(content)
+
+
 def _convert_content_part(part: dict) -> dict | None:
     """Convert a single Responses API content part to Chat Completions format."""
     part_type = part.get("type", "")
@@ -95,10 +119,11 @@ def _convert_message(msg: dict) -> dict | None:
     msg_type = msg.get("type", "")
 
     if msg_type == "function_call_output":
+        output = _convert_content(msg.get("output", ""))
         return {
             "role": "tool",
             "tool_call_id": msg.get("call_id") or msg.get("id", ""),
-            "content": msg.get("output", ""),
+            "content": _coerce_text_content(output),
         }
 
     if msg_type == "function_call":
@@ -125,6 +150,13 @@ def _convert_message(msg: dict) -> dict | None:
         role = "system"
     result["role"] = role
     result["content"] = _convert_content(msg.get("content"))
+    if role == "tool":
+        # Compatibility: some callers use call_id/id on tool messages.
+        if "tool_call_id" not in msg:
+            tool_call_id = msg.get("call_id") or msg.get("id", "")
+            if tool_call_id:
+                result["tool_call_id"] = tool_call_id
+        result["content"] = _coerce_text_content(result.get("content"))
     for key in ("name", "tool_calls", "tool_call_id", "reasoning_content"):
         if key in msg:
             result[key] = msg[key]

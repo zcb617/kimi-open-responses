@@ -193,3 +193,33 @@ def test_empty_assistant_message_filtered():
     }
     result = convert_request(req)
     assert result["messages"] == [{"role": "user", "content": "Hello!"}]
+
+
+def test_role_tool_with_call_id_mapped_to_tool_call_id():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {"role": "tool", "call_id": "shell_command:145", "content": "done"},
+        ],
+    }
+    result = convert_request(req)
+    assert result["messages"][0]["role"] == "tool"
+    assert result["messages"][0]["tool_call_id"] == "shell_command:145"
+    assert result["messages"][0]["content"] == "done"
+
+
+def test_function_call_output_content_parts_coerced_to_text():
+    req = {
+        "model": "kimi-k2.6",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "shell_command:145",
+                "output": [{"type": "output_text", "text": "file.txt"}],
+            },
+        ],
+    }
+    result = convert_request(req)
+    assert result["messages"][0]["role"] == "tool"
+    assert result["messages"][0]["tool_call_id"] == "shell_command:145"
+    assert result["messages"][0]["content"] == "file.txt"
