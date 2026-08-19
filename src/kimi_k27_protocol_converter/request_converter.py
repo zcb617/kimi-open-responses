@@ -27,9 +27,24 @@ def _custom_tool_parameters(tool: dict) -> dict:
     """Expose a custom tool as one JSON string argument to Chat Completions."""
     # The custom Responses input is free-form text; wrapping it in one required
     # property gives Kimi a valid JSON-schema function declaration.
+    input_description = "Raw custom-tool input. Put the complete free-form payload in this string."
+    tool_format = tool.get("format")
+    if isinstance(tool_format, dict) and tool_format.get("type") == "grammar":
+        grammar = tool_format.get("definition")
+        if isinstance(grammar, str) and grammar:
+            syntax = tool_format.get("syntax", "grammar")
+            input_description += f" The string must match this {syntax} grammar:\n{grammar}"
+    if tool.get("name") == "apply_patch":
+        input_description += (
+            " The input must start with '*** Begin Patch' and end with '*** End Patch'."
+            " In an added line, '+' is a syntax marker and the following characters become"
+            " file content; do not add a separator space after '+' unless that space belongs"
+            " in the file."
+        )
+
     return {
         "type": "object",
-        "properties": {"input": {"type": "string"}},
+        "properties": {"input": {"type": "string", "description": input_description}},
         "required": ["input"],
         "additionalProperties": False,
     }
@@ -87,6 +102,41 @@ def _convert_additional_tool(tool_entry: dict) -> tuple[dict | None, str | None]
         }
         return {"type": "function", "function": function_def}, "custom"
     return None, None
+
+
+def _convert_top_level_tool(tool: dict) -> dict | None:
+    """Convert current Codex function/custom tools to Chat Completions format."""
+    if not isinstance(tool, dict):
+        return None
+
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+
+    if tool.get("type") == "custom":
+        return {
+            "type": "function",
+            "function": {
+                "name": _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, "", name),
+                "description": tool.get("description", ""),
+                "parameters": _custom_tool_parameters(tool),
+            },
+        }
+
+    if tool.get("type") != "function":
+        return None
+
+    function_def = {
+        "name": name,
+        "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+    }
+    description = tool.get("description")
+    if isinstance(description, str):
+        function_def["description"] = description
+    if isinstance(tool.get("strict"), bool):
+        function_def["strict"] = tool["strict"]
+
+    return {"type": "function", "function": function_def}
 
 
 def _coerce_text_content(content) -> str:
@@ -458,7 +508,12 @@ def convert_request(responses_req: dict) -> dict:
     if response_format is not None:
         chat_req["response_format"] = response_format
 
-    # Current Codex tool declarations are nested in input.additional_tools.
+    for tool in responses_req.get("tools", []):
+        converted_tool = _convert_top_level_tool(tool)
+        if converted_tool is not None:
+            chat_req.setdefault("tools", []).append(converted_tool)
+
+    # Codex Desktop namespace tools are nested in input.additional_tools.
     for entry in additional_tool_entries:
         converted_tool, _kind = _convert_additional_tool(entry)
         if converted_tool is not None:

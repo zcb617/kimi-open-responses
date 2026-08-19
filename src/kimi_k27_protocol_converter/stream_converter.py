@@ -207,7 +207,9 @@ class StreamConverter:
         self._emitted_tool_ids: set[int] = set()
         self._emitted_tool_call_items: set[int] = set()
         self._tool_call_output_indices: dict[int, int] = {}
-        self._next_output_index = 1  # 0 is reserved for the message item
+        self._message_output_index: int | None = None
+        self._message_started = False
+        self._next_output_index = 0
         self._completed = False
         self._message_done = False
         self._usage: dict | None = None
@@ -262,18 +264,31 @@ class StreamConverter:
                 "sequence_number": self._next_seq(),
             }, separators=(",", ":")),
             json.dumps({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "id": self.item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "in_progress",
-                    "content": [],
-                },
+                "type": "response.in_progress",
+                "response": self._build_response_object(status="in_progress", output=[]),
                 "sequence_number": self._next_seq(),
             }, separators=(",", ":")),
         ]
+
+    def _ensure_message_started(self, events: list[str]) -> None:
+        if self._message_started:
+            return
+
+        self._message_started = True
+        self._message_output_index = self._next_output_index
+        self._next_output_index += 1
+        events.append(json.dumps({
+            "type": "response.output_item.added",
+            "output_index": self._message_output_index,
+            "item": {
+                "id": self.item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
 
     def process_event(self, event_data: str) -> list[str]:
         """Process a single chat.completions SSE event.
@@ -354,7 +369,7 @@ class StreamConverter:
             }, separators=(",", ":")))
 
         # Handle content
-        if content is not None:
+        if content:
             # Transition from reasoning to content: end reasoning first
             if self._in_reasoning:
                 self._in_reasoning = False
@@ -385,11 +400,12 @@ class StreamConverter:
                     }, separators=(",", ":")))
 
             # First actual content: emit content_part.added for output_text
-            if content and not self._text_parts:
+            if not self._text_parts:
+                self._ensure_message_started(events)
                 events.append(json.dumps({
                     "type": "response.content_part.added",
                     "item_id": self.item_id,
-                    "output_index": 0,
+                    "output_index": self._message_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": "", "annotations": []},
                     "sequence_number": self._next_seq(),
@@ -399,7 +415,7 @@ class StreamConverter:
             events.append(json.dumps({
                 "type": "response.output_text.delta",
                 "item_id": self.item_id,
-                "output_index": 0,
+                "output_index": self._message_output_index,
                 "content_index": 0,
                 "delta": content,
                 "logprobs": [],
@@ -442,7 +458,7 @@ class StreamConverter:
                 events.append(json.dumps({
                     "type": "response.output_text.done",
                     "item_id": self.item_id,
-                    "output_index": 0,
+                    "output_index": self._message_output_index,
                     "content_index": 0,
                     "text": text_content,
                     "logprobs": [],
@@ -451,9 +467,25 @@ class StreamConverter:
                 events.append(json.dumps({
                     "type": "response.content_part.done",
                     "item_id": self.item_id,
-                    "output_index": 0,
+                    "output_index": self._message_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": text_content, "annotations": []},
+                    "sequence_number": self._next_seq(),
+                }, separators=(",", ":")))
+                events.append(json.dumps({
+                    "type": "response.output_item.done",
+                    "output_index": self._message_output_index,
+                    "item": {
+                        "id": self.item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text_content,
+                            "annotations": [],
+                        }],
+                    },
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
                 self._message_done = True
@@ -503,14 +535,14 @@ class StreamConverter:
         if text_content:
             content_parts.append({"type": "output_text", "text": text_content, "annotations": []})
 
-        # Close message item if not yet done (covers: has content, no content+no tools, no content+has tools)
-        if not self._message_done:
+        # Close the message only if a message item was actually started.
+        if self._message_started and not self._message_done:
             if text_content:
                 # output_text.done
                 events.append(json.dumps({
                     "type": "response.output_text.done",
                     "item_id": self.item_id,
-                    "output_index": 0,
+                    "output_index": self._message_output_index,
                     "content_index": 0,
                     "text": text_content,
                     "logprobs": [],
@@ -521,35 +553,15 @@ class StreamConverter:
                 events.append(json.dumps({
                     "type": "response.content_part.done",
                     "item_id": self.item_id,
-                    "output_index": 0,
+                    "output_index": self._message_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": text_content, "annotations": []},
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
-            elif not self._tool_calls:
-                # No content and no tool calls: still emit output_text.done (even if empty)
-                events.append(json.dumps({
-                    "type": "response.output_text.done",
-                    "item_id": self.item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": text_content,
-                    "logprobs": [],
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
-                events.append(json.dumps({
-                    "type": "response.content_part.done",
-                    "item_id": self.item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text_content, "annotations": []},
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
-
-            # output_item.done for message (always emitted when closing)
+            # output_item.done for the started message
             events.append(json.dumps({
                 "type": "response.output_item.done",
-                "output_index": 0,
+                "output_index": self._message_output_index,
                 "item": {
                     "id": self.item_id,
                     "type": "message",
@@ -559,6 +571,7 @@ class StreamConverter:
                 },
                 "sequence_number": self._next_seq(),
             }, separators=(",", ":")))
+            self._message_done = True
 
         # Close any tool calls that were emitted
         for index, tc in self._tool_calls.items():
