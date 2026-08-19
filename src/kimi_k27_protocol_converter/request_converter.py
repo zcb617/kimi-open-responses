@@ -444,6 +444,25 @@ def _convert_message(
     return result
 
 
+def _extract_reasoning_content(item: dict) -> str:
+    """Extract reasoning text from a Responses reasoning output item."""
+    if item.get("type") != "reasoning":
+        return ""
+
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "reasoning_text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
 def convert_request(responses_req: dict) -> dict:
     """Convert a responses API request dict to chat.completions format."""
     chat_req: dict = {"model": responses_req["model"]}
@@ -471,25 +490,45 @@ def convert_request(responses_req: dict) -> dict:
         chat_req["messages"] = [{"role": "user", "content": input_data}]
     elif isinstance(input_data, list):
         converted_msgs = []
+        pending_reasoning_content = ""
         for m in input_data:
+            reasoning_content = _extract_reasoning_content(m)
+            if m.get("type") == "reasoning":
+                pending_reasoning_content += reasoning_content
+                continue
+
             cm = _convert_message(m, custom_name_map, namespace_name_map)
             if cm is None:
                 continue
             role = cm.get("role", "")
             content = cm.get("content")
+            if role == "assistant" and pending_reasoning_content:
+                if not cm.get("reasoning_content"):
+                    cm["reasoning_content"] = pending_reasoning_content
+                pending_reasoning_content = ""
+            elif role != "assistant":
+                pending_reasoning_content = ""
             if role in ("user", "system") and _is_empty_content(content):
                 continue
             # Kimi rejects empty assistant text messages; keep only assistant
             # messages with content or tool_calls.
             if role == "assistant" and not cm.get("tool_calls") and _is_empty_content(content):
                 continue
-            # Merge consecutive assistant tool_calls into a single message
+            # A Responses assistant turn is split into reasoning, message, and
+            # tool-call output items. Reassemble them into one Chat message.
             if (role == "assistant"
-                    and cm.get("tool_calls")
                     and converted_msgs
-                    and converted_msgs[-1].get("role") == "assistant"
-                    and converted_msgs[-1].get("tool_calls")):
-                converted_msgs[-1]["tool_calls"].extend(cm["tool_calls"])
+                    and converted_msgs[-1].get("role") == "assistant"):
+                previous = converted_msgs[-1]
+                if not _is_empty_content(content):
+                    if _is_empty_content(previous.get("content")):
+                        previous["content"] = content
+                    elif isinstance(previous.get("content"), str) and isinstance(content, str):
+                        previous["content"] += content
+                if cm.get("reasoning_content") and not previous.get("reasoning_content"):
+                    previous["reasoning_content"] = cm["reasoning_content"]
+                if cm.get("tool_calls"):
+                    previous.setdefault("tool_calls", []).extend(cm["tool_calls"])
                 continue
             converted_msgs.append(cm)
         chat_req["messages"] = _normalize_tool_call_sequences(converted_msgs)
@@ -523,6 +562,4 @@ def convert_request(responses_req: dict) -> dict:
         tc = responses_req["tool_choice"]
         chat_req["tool_choice"] = "none" if tc == "none" else "auto"
 
-    # K2.7 Code requires thinking mode and rejects disabled thinking.
-    chat_req["thinking"] = {"type": "enabled"}
     return chat_req
