@@ -5,6 +5,8 @@ import json
 import time
 import uuid
 
+from .reasoning_summary import build_visible_reasoning_summary
+
 
 def _map_chat_usage_to_responses(chat_usage: dict | None) -> dict | None:
     """Map chat.completions usage shape to Responses usage shape."""
@@ -185,7 +187,7 @@ class StreamConverter:
     """Converts chat.completions SSE events to responses API SSE events.
 
     Maps Kimi API (OpenAI-compatible) stream to OpenAI Responses API stream:
-    - Kimi delta.reasoning_content -> response.reasoning_text.delta
+    - Kimi delta.reasoning_content -> hidden reasoning_text plus visible reasoning summary
     - Kimi delta.content         -> response.output_text.delta
     """
 
@@ -290,6 +292,87 @@ class StreamConverter:
             "sequence_number": self._next_seq(),
         }, separators=(",", ":")))
 
+    def _finish_reasoning(
+        self,
+        events: list[str],
+        pending_tool_calls: list[dict] | None = None,
+    ) -> None:
+        if not self._reasoning_started or self._reasoning_item_done:
+            return
+
+        self._in_reasoning = False
+        reasoning_text = "".join(self._reasoning_parts)
+        summary_tool_calls = list(self._tool_calls.values())
+        if pending_tool_calls:
+            summary_tool_calls.extend(pending_tool_calls)
+        summary_text = build_visible_reasoning_summary(
+            reasoning_text,
+            summary_tool_calls,
+        )
+        if summary_text:
+            summary_part = {"type": "summary_text", "text": summary_text}
+            events.append(json.dumps({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": self._reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+                "sequence_number": self._next_seq(),
+            }, separators=(",", ":")))
+            events.append(json.dumps({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": self._reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "summary_index": 0,
+                "delta": summary_text,
+                "sequence_number": self._next_seq(),
+            }, separators=(",", ":")))
+            events.append(json.dumps({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self._reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "summary_index": 0,
+                "text": summary_text,
+                "sequence_number": self._next_seq(),
+            }, separators=(",", ":")))
+            events.append(json.dumps({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self._reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "summary_index": 0,
+                "part": summary_part,
+                "sequence_number": self._next_seq(),
+            }, separators=(",", ":")))
+
+        events.append(json.dumps({
+            "type": "response.reasoning_text.done",
+            "item_id": self._reasoning_item_id,
+            "output_index": self._reasoning_output_index,
+            "content_index": 0,
+            "text": reasoning_text,
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        self._reasoning_item_done = True
+        events.append(json.dumps({
+            "type": "response.output_item.done",
+            "output_index": self._reasoning_output_index,
+            "item": {
+                "id": self._reasoning_item_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": (
+                    [{"type": "summary_text", "text": summary_text}]
+                    if summary_text
+                    else []
+                ),
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": reasoning_text,
+                }],
+            },
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+
     def process_event(self, event_data: str) -> list[str]:
         """Process a single chat.completions SSE event.
 
@@ -372,32 +455,7 @@ class StreamConverter:
         if content:
             # Transition from reasoning to content: end reasoning first
             if self._in_reasoning:
-                self._in_reasoning = False
-                events.append(json.dumps({
-                    "type": "response.reasoning_text.done",
-                    "item_id": self._reasoning_item_id,
-                    "output_index": self._reasoning_output_index,
-                    "content_index": 0,
-                    "text": "".join(self._reasoning_parts),
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
-                if not self._reasoning_item_done:
-                    self._reasoning_item_done = True
-                    events.append(json.dumps({
-                        "type": "response.output_item.done",
-                        "output_index": self._reasoning_output_index,
-                        "item": {
-                            "id": self._reasoning_item_id,
-                            "type": "reasoning",
-                            "status": "completed",
-                            "summary": [],
-                            "content": [{
-                                "type": "reasoning_text",
-                                "text": "".join(self._reasoning_parts),
-                            }],
-                        },
-                        "sequence_number": self._next_seq(),
-                    }, separators=(",", ":")))
+                self._finish_reasoning(events)
 
             # First actual content: emit content_part.added for output_text
             if not self._text_parts:
@@ -423,36 +481,10 @@ class StreamConverter:
             }, separators=(",", ":")))
 
         if tool_calls:
-            reasoning_text = "".join(self._reasoning_parts)
             text_content = "".join(self._text_parts)
             # Transition from reasoning to tool_calls: close reasoning first
             if self._in_reasoning:
-                self._in_reasoning = False
-                events.append(json.dumps({
-                    "type": "response.reasoning_text.done",
-                    "item_id": self._reasoning_item_id,
-                    "output_index": self._reasoning_output_index,
-                    "content_index": 0,
-                    "text": reasoning_text,
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
-                if not self._reasoning_item_done:
-                    self._reasoning_item_done = True
-                    events.append(json.dumps({
-                        "type": "response.output_item.done",
-                        "output_index": self._reasoning_output_index,
-                        "item": {
-                            "id": self._reasoning_item_id,
-                            "type": "reasoning",
-                            "status": "completed",
-                            "summary": [],
-                            "content": [{
-                                "type": "reasoning_text",
-                                "text": reasoning_text,
-                            }],
-                        },
-                        "sequence_number": self._next_seq(),
-                    }, separators=(",", ":")))
+                self._finish_reasoning(events, tool_calls)
             # Transition from content to tool_calls: close content first
             if text_content and not self._message_done:
                 events.append(json.dumps({
@@ -503,32 +535,7 @@ class StreamConverter:
 
         # End reasoning if still in progress
         if self._in_reasoning:
-            self._in_reasoning = False
-            events.append(json.dumps({
-                "type": "response.reasoning_text.done",
-                "item_id": self._reasoning_item_id,
-                "output_index": self._reasoning_output_index,
-                "content_index": 0,
-                "text": reasoning_text,
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
-            if not self._reasoning_item_done:
-                self._reasoning_item_done = True
-                events.append(json.dumps({
-                    "type": "response.output_item.done",
-                    "output_index": self._reasoning_output_index,
-                    "item": {
-                        "id": self._reasoning_item_id,
-                        "type": "reasoning",
-                        "status": "completed",
-                        "summary": [],
-                        "content": [{
-                            "type": "reasoning_text",
-                            "text": reasoning_text,
-                        }],
-                    },
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
+            self._finish_reasoning(events)
 
         # Message content parts for done events (reasoning lives in a separate output item)
         content_parts: list[dict] = []
@@ -630,11 +637,19 @@ class StreamConverter:
         # Build output array for response.completed
         output_items: list[dict] = []
         if reasoning_text:
+            summary_text = build_visible_reasoning_summary(
+                reasoning_text,
+                self._tool_calls.values(),
+            )
             output_items.append({
                 "id": self._reasoning_item_id,
                 "type": "reasoning",
                 "status": "completed",
-                "summary": [],
+                "summary": (
+                    [{"type": "summary_text", "text": summary_text}]
+                    if summary_text
+                    else []
+                ),
                 "content": [{
                     "type": "reasoning_text",
                     "text": reasoning_text,

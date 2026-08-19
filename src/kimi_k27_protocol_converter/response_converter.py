@@ -1,6 +1,8 @@
 """Convert chat.completions responses to responses API format."""
 import uuid
 
+from .reasoning_summary import build_visible_reasoning_summary
+
 
 def _extract_text_content(content) -> str:
     """Normalize chat message content to plain text."""
@@ -46,11 +48,19 @@ def convert_response(chat_resp: dict) -> dict:
 
     reasoning_content = message.get("reasoning_content")
     if isinstance(reasoning_content, str) and reasoning_content:
+        summary_text = build_visible_reasoning_summary(
+            reasoning_content,
+            message.get("tool_calls") or [],
+        )
         output_items.append({
             "id": f"rs_{uuid.uuid4().hex[:24]}",
             "type": "reasoning",
             "status": "completed",
-            "summary": [],
+            "summary": (
+                [{"type": "summary_text", "text": summary_text}]
+                if summary_text
+                else []
+            ),
             "content": [{
                 "type": "reasoning_text",
                 "text": reasoning_content,
