@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 
-from .reasoning_summary import build_visible_reasoning_summary
+from .reasoning_progress import build_visible_progress
 
 
 def _map_chat_usage_to_responses(chat_usage: dict | None) -> dict | None:
@@ -187,8 +187,9 @@ class StreamConverter:
     """Converts chat.completions SSE events to responses API SSE events.
 
     Maps Kimi API (OpenAI-compatible) stream to OpenAI Responses API stream:
-    - Kimi delta.reasoning_content -> hidden reasoning_text plus visible reasoning summary
+    - Kimi delta.reasoning_content -> hidden reasoning_text
     - Kimi delta.content         -> response.output_text.delta
+    - Tool calls without content -> one concise visible progress message
     """
 
     def __init__(self, response_id: str, model: str):
@@ -292,58 +293,12 @@ class StreamConverter:
             "sequence_number": self._next_seq(),
         }, separators=(",", ":")))
 
-    def _finish_reasoning(
-        self,
-        events: list[str],
-        pending_tool_calls: list[dict] | None = None,
-    ) -> None:
+    def _finish_reasoning(self, events: list[str]) -> None:
         if not self._reasoning_started or self._reasoning_item_done:
             return
 
         self._in_reasoning = False
         reasoning_text = "".join(self._reasoning_parts)
-        summary_tool_calls = list(self._tool_calls.values())
-        if pending_tool_calls:
-            summary_tool_calls.extend(pending_tool_calls)
-        summary_text = build_visible_reasoning_summary(
-            reasoning_text,
-            summary_tool_calls,
-        )
-        if summary_text:
-            summary_part = {"type": "summary_text", "text": summary_text}
-            events.append(json.dumps({
-                "type": "response.reasoning_summary_part.added",
-                "item_id": self._reasoning_item_id,
-                "output_index": self._reasoning_output_index,
-                "summary_index": 0,
-                "part": {"type": "summary_text", "text": ""},
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
-            events.append(json.dumps({
-                "type": "response.reasoning_summary_text.delta",
-                "item_id": self._reasoning_item_id,
-                "output_index": self._reasoning_output_index,
-                "summary_index": 0,
-                "delta": summary_text,
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
-            events.append(json.dumps({
-                "type": "response.reasoning_summary_text.done",
-                "item_id": self._reasoning_item_id,
-                "output_index": self._reasoning_output_index,
-                "summary_index": 0,
-                "text": summary_text,
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
-            events.append(json.dumps({
-                "type": "response.reasoning_summary_part.done",
-                "item_id": self._reasoning_item_id,
-                "output_index": self._reasoning_output_index,
-                "summary_index": 0,
-                "part": summary_part,
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
-
         events.append(json.dumps({
             "type": "response.reasoning_text.done",
             "item_id": self._reasoning_item_id,
@@ -360,11 +315,7 @@ class StreamConverter:
                 "id": self._reasoning_item_id,
                 "type": "reasoning",
                 "status": "completed",
-                "summary": (
-                    [{"type": "summary_text", "text": summary_text}]
-                    if summary_text
-                    else []
-                ),
+                "summary": [],
                 "content": [{
                     "type": "reasoning_text",
                     "text": reasoning_text,
@@ -372,6 +323,116 @@ class StreamConverter:
             },
             "sequence_number": self._next_seq(),
         }, separators=(",", ":")))
+
+    def _emit_progress_message(self, events: list[str], text: str) -> None:
+        if not text or self._message_started:
+            return
+
+        self._ensure_message_started(events)
+        events.append(json.dumps({
+            "type": "response.content_part.added",
+            "item_id": self.item_id,
+            "output_index": self._message_output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        self._text_parts.append(text)
+        events.append(json.dumps({
+            "type": "response.output_text.delta",
+            "item_id": self.item_id,
+            "output_index": self._message_output_index,
+            "content_index": 0,
+            "delta": text,
+            "logprobs": [],
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        events.append(json.dumps({
+            "type": "response.output_text.done",
+            "item_id": self.item_id,
+            "output_index": self._message_output_index,
+            "content_index": 0,
+            "text": text,
+            "logprobs": [],
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        events.append(json.dumps({
+            "type": "response.content_part.done",
+            "item_id": self.item_id,
+            "output_index": self._message_output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []},
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        events.append(json.dumps({
+            "type": "response.output_item.done",
+            "output_index": self._message_output_index,
+            "item": {
+                "id": self.item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }],
+            },
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+        self._message_done = True
+
+    def _has_complete_tool_call(self) -> bool:
+        return any(
+            tool_call.get("call_id")
+            and tool_call.get("item_id")
+            and tool_call.get("name")
+            for tool_call in self._tool_calls.values()
+        )
+
+    def _emit_failure_event(self, events: list[str], reason: str) -> None:
+        if self._completed:
+            return
+        self._completed = True
+        response = self._build_response_object(status="failed", output=[])
+        response["error"] = {
+            "code": "server_error",
+            "message": reason,
+        }
+        events.append(json.dumps({
+            "type": "response.failed",
+            "response": response,
+            "sequence_number": self._next_seq(),
+        }, separators=(",", ":")))
+
+    def _emit_terminal_events(
+        self,
+        events: list[str],
+        finish_reason: str | None,
+    ) -> None:
+        has_text = bool("".join(self._text_parts).strip())
+        has_tool_call = self._has_complete_tool_call()
+
+        if finish_reason is None:
+            successful = has_text or has_tool_call
+        elif finish_reason == "stop":
+            successful = has_text
+        elif finish_reason == "tool_calls":
+            successful = has_tool_call
+        else:
+            successful = False
+
+        if successful:
+            self._emit_completion_events(events)
+            return
+
+        if finish_reason not in (None, "stop", "tool_calls"):
+            reason = f"Kimi upstream ended with finish_reason={finish_reason}"
+        elif finish_reason == "tool_calls":
+            reason = "Kimi upstream ended with tool_calls but returned no complete tool call"
+        else:
+            reason = "Kimi upstream returned only reasoning without text or tool calls"
+        self._emit_failure_event(events, reason)
 
     def process_event(self, event_data: str) -> list[str]:
         """Process a single chat.completions SSE event.
@@ -381,7 +442,7 @@ class StreamConverter:
         events: list[str] = []
 
         if event_data.strip() == "[DONE]":
-            self._emit_completion_events(events)
+            self._emit_terminal_events(events, None)
             return events
 
         try:
@@ -407,10 +468,10 @@ class StreamConverter:
         tool_calls = delta.get("tool_calls")
         finish_reason = choice.get("finish_reason")
 
-        # When upstream signals completion, emit completion events immediately.
-        # Some APIs may not send [DONE] reliably, so we react to finish_reason.
+        # Only successful terminal states may become response.completed.
+        # Abnormal or think-only endings must remain retryable failures.
         if finish_reason is not None and not self._completed:
-            self._emit_completion_events(events)
+            self._emit_terminal_events(events, str(finish_reason))
             return events
 
         # Handle reasoning_content (Kimi API specific field)
@@ -484,7 +545,14 @@ class StreamConverter:
             text_content = "".join(self._text_parts)
             # Transition from reasoning to tool_calls: close reasoning first
             if self._in_reasoning:
-                self._finish_reasoning(events, tool_calls)
+                progress_text = (
+                    build_visible_progress("".join(self._reasoning_parts))
+                    if not text_content
+                    else ""
+                )
+                self._finish_reasoning(events)
+                if progress_text:
+                    self._emit_progress_message(events, progress_text)
             # Transition from content to tool_calls: close content first
             if text_content and not self._message_done:
                 events.append(json.dumps({
@@ -637,19 +705,11 @@ class StreamConverter:
         # Build output array for response.completed
         output_items: list[dict] = []
         if reasoning_text:
-            summary_text = build_visible_reasoning_summary(
-                reasoning_text,
-                self._tool_calls.values(),
-            )
             output_items.append({
                 "id": self._reasoning_item_id,
                 "type": "reasoning",
                 "status": "completed",
-                "summary": (
-                    [{"type": "summary_text", "text": summary_text}]
-                    if summary_text
-                    else []
-                ),
+                "summary": [],
                 "content": [{
                     "type": "reasoning_text",
                     "text": reasoning_text,

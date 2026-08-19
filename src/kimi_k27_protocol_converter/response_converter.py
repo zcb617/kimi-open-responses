@@ -1,7 +1,7 @@
 """Convert chat.completions responses to responses API format."""
 import uuid
 
-from .reasoning_summary import build_visible_reasoning_summary
+from .reasoning_progress import build_visible_progress
 
 
 def _extract_text_content(content) -> str:
@@ -46,21 +46,14 @@ def convert_response(chat_resp: dict) -> dict:
     output_items: list[dict] = []
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+    tool_calls = message.get("tool_calls") or []
     reasoning_content = message.get("reasoning_content")
     if isinstance(reasoning_content, str) and reasoning_content:
-        summary_text = build_visible_reasoning_summary(
-            reasoning_content,
-            message.get("tool_calls") or [],
-        )
         output_items.append({
             "id": f"rs_{uuid.uuid4().hex[:24]}",
             "type": "reasoning",
             "status": "completed",
-            "summary": (
-                [{"type": "summary_text", "text": summary_text}]
-                if summary_text
-                else []
-            ),
+            "summary": [],
             "content": [{
                 "type": "reasoning_text",
                 "text": reasoning_content,
@@ -68,8 +61,9 @@ def convert_response(chat_resp: dict) -> dict:
         })
 
     refusal = message.get("refusal")
-    tool_calls = message.get("tool_calls") or []
     content_text = _extract_text_content(message.get("content"))
+    if not content_text and tool_calls and isinstance(reasoning_content, str):
+        content_text = build_visible_progress(reasoning_content)
 
     # Message item: keep refusal/text in standard message content.
     # Tool calls are emitted as standalone function_call output items.
