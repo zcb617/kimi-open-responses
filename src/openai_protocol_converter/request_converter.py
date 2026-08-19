@@ -1,10 +1,92 @@
 """Convert responses API requests to chat.completions format."""
 
+import base64
+import json
+
+
+# Prefix is part of the wire-level compatibility contract with stream_converter.
+# It keeps namespace collisions reversible without changing src/proxy.py.
+_CUSTOM_TOOL_PROXY_PREFIX = "__cf1_"
+_NAMESPACE_TOOL_PROXY_PREFIX = "__nf1_"
+
 
 _INPUT_TEXT = "input_text"
 _OUTPUT_TEXT = "output_text"
 _INPUT_IMAGE = "input_image"
 _REFUSAL = "refusal"
+
+
+def _encode_tool_proxy(prefix: str, namespace: str, name: str) -> str:
+    """Encode namespace and tool name into a deterministic Chat tool name."""
+    payload = json.dumps([namespace, name], ensure_ascii=False, separators=(",", ":"))
+    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{prefix}{token}"
+
+
+def _custom_tool_parameters(tool: dict) -> dict:
+    """Expose a custom tool as one JSON string argument to Chat Completions."""
+    # The custom Responses input is free-form text; wrapping it in one required
+    # property gives Kimi a valid JSON-schema function declaration.
+    return {
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+        "additionalProperties": False,
+    }
+
+
+def _iter_additional_tools(input_data) -> list[dict]:
+    """Yield namespace tool definitions embedded in input additional_tools."""
+    if not isinstance(input_data, list):
+        return []
+    result: list[dict] = []
+    for item in input_data:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        namespaces = item.get("tools", [])
+        if not isinstance(namespaces, list):
+            continue
+        for namespace_item in namespaces:
+            if not isinstance(namespace_item, dict):
+                continue
+            namespace = namespace_item.get("namespace") or namespace_item.get("name") or ""
+            nested = namespace_item.get("tools", [])
+            if not isinstance(nested, list):
+                continue
+            for tool in nested:
+                if isinstance(tool, dict):
+                    result.append({"namespace": str(namespace), "tool": tool})
+    return result
+
+
+def _convert_additional_tool(tool_entry: dict) -> tuple[dict | None, str | None]:
+    """Convert one namespaced Responses tool and return (Chat tool, kind)."""
+    namespace = tool_entry.get("namespace", "")
+    tool = tool_entry.get("tool", {})
+    tool_type = tool.get("type")
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        return None, None
+    if tool_type == "function":
+        # Namespace function names use the same reversible encoding as custom
+        # tools; punctuation in a namespace must not violate Chat name rules.
+        proxy_name = _encode_tool_proxy(_NAMESPACE_TOOL_PROXY_PREFIX, namespace, name)
+        function_def = {
+            key: tool[key]
+            for key in ("description", "parameters", "strict")
+            if key in tool
+        }
+        function_def["name"] = proxy_name
+        return {"type": "function", "function": function_def}, "function"
+    if tool_type == "custom":
+        proxy_name = _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, namespace, name)
+        function_def = {
+            "name": proxy_name,
+            "description": tool.get("description", ""),
+            "parameters": _custom_tool_parameters(tool),
+        }
+        return {"type": "function", "function": function_def}, "custom"
+    return None, None
 
 
 def _coerce_text_content(content) -> str:
@@ -222,11 +304,17 @@ def _convert_response_format(text_config: dict) -> dict | None:
     }
 
 
-def _convert_message(msg: dict) -> dict | None:
+def _convert_message(
+    msg: dict,
+    custom_name_map: dict[str, str] | None = None,
+    namespace_name_map: dict[tuple[str, str], str] | None = None,
+) -> dict | None:
     """Convert a single Responses API message to Chat Completions format."""
     msg_type = msg.get("type", "")
 
-    if msg_type == "function_call_output":
+    custom_name_map = custom_name_map or {}
+    namespace_name_map = namespace_name_map or {}
+    if msg_type in ("custom_tool_call_output", "function_call_output"):
         output = _convert_content(msg.get("output", ""))
         tool_call_id = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id", "")
         return {
@@ -235,11 +323,31 @@ def _convert_message(msg: dict) -> dict | None:
             "content": _coerce_text_content(output),
         }
 
-    if msg_type == "function_call":
+    if msg_type in ("custom_tool_call", "function_call"):
         reasoning_content = msg.get("reasoning_content", "")
         if not isinstance(reasoning_content, str):
             reasoning_content = ""
         call_id = msg.get("call_id") or msg.get("tool_call_id") or msg.get("id", "")
+        name = msg.get("name", "")
+        namespace = msg.get("namespace")
+        if msg_type == "function_call" and isinstance(namespace, str) and isinstance(name, str):
+            name = namespace_name_map.get(
+                (namespace, name), _encode_tool_proxy(_NAMESPACE_TOOL_PROXY_PREFIX, namespace, name)
+            )
+        # Custom tool input is free-form, while Chat requires a function
+        # arguments string. Preserve raw input and use the current tool map
+        # when this history item has a matching custom declaration.
+        if msg_type == "custom_tool_call":
+            name = custom_name_map.get(name, name)
+            if "input" in msg:
+                raw_input = msg.get("input", "")
+                if not isinstance(raw_input, str):
+                    raw_input = _coerce_text_content(raw_input)
+                arguments = json.dumps({"input": raw_input}, ensure_ascii=False)
+            else:
+                arguments = msg.get("arguments", "")
+        else:
+            arguments = msg.get("arguments", "")
         return {
             "role": "assistant",
             "content": None,
@@ -248,8 +356,8 @@ def _convert_message(msg: dict) -> dict | None:
                 "id": call_id,
                 "type": "function",
                 "function": {
-                    "name": msg.get("name", ""),
-                    "arguments": msg.get("arguments", ""),
+                    "name": name,
+                    "arguments": arguments,
                 },
             }],
         }
@@ -270,6 +378,19 @@ def _convert_message(msg: dict) -> dict | None:
     for key in ("name", "tool_calls", "tool_call_id", "reasoning_content"):
         if key in msg:
             result[key] = msg[key]
+    if role == "assistant" and isinstance(result.get("tool_calls"), list):
+        for tool_call in result["tool_calls"]:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            namespace = tool_call.get("namespace") or function.get("namespace")
+            name = function.get("name")
+            if isinstance(namespace, str) and isinstance(name, str):
+                function["name"] = namespace_name_map.get(
+                    (namespace, name), _encode_tool_proxy(_NAMESPACE_TOOL_PROXY_PREFIX, namespace, name)
+                )
     return result
 
 
@@ -278,12 +399,30 @@ def convert_request(responses_req: dict) -> dict:
     chat_req: dict = {"model": responses_req["model"]}
 
     input_data = responses_req.get("input", "")
+    additional_tool_entries = _iter_additional_tools(input_data)
+    custom_name_map = {}
+    namespace_name_map = {}
+    for entry in additional_tool_entries:
+        tool = entry["tool"]
+        if tool.get("type") == "function" and isinstance(tool.get("name"), str):
+            namespace_name_map[(entry["namespace"], tool["name"])] = _encode_tool_proxy(
+                _NAMESPACE_TOOL_PROXY_PREFIX, entry["namespace"], tool["name"]
+            )
+        if tool.get("type") == "custom" and isinstance(tool.get("name"), str):
+            # A name is mapped only when unambiguous; duplicate names remain
+            # caller-provided names and cannot be inferred from history alone.
+            custom_name_map.setdefault(tool["name"], []).append(entry)
+    custom_name_map = {
+        name: _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, entries[0]["namespace"], name)
+        for name, entries in custom_name_map.items()
+        if len(entries) == 1
+    }
     if isinstance(input_data, str):
         chat_req["messages"] = [{"role": "user", "content": input_data}]
     elif isinstance(input_data, list):
         converted_msgs = []
         for m in input_data:
-            cm = _convert_message(m)
+            cm = _convert_message(m, custom_name_map, namespace_name_map)
             if cm is None:
                 continue
             role = cm.get("role", "")
@@ -320,23 +459,11 @@ def convert_request(responses_req: dict) -> dict:
     if response_format is not None:
         chat_req["response_format"] = response_format
 
-    # Tools — Responses API format differs from Chat Completions
-    if "tools" in responses_req:
-        tools = responses_req["tools"]
-        if isinstance(tools, list):
-            chat_req["tools"] = []
-            for tool in tools:
-                if tool.get("type") == "function":
-                    function_def = {}
-                    for key in ("name", "description", "parameters", "strict"):
-                        if key in tool:
-                            function_def[key] = tool[key]
-                    chat_req["tools"].append({
-                        "type": "function",
-                        "function": function_def,
-                    })
-            if not chat_req["tools"]:
-                del chat_req["tools"]
+    # Current Codex tool declarations are nested in input.additional_tools.
+    for entry in additional_tool_entries:
+        converted_tool, _kind = _convert_additional_tool(entry)
+        if converted_tool is not None:
+            chat_req.setdefault("tools", []).append(converted_tool)
 
     if "tool_choice" in responses_req:
         tc = responses_req["tool_choice"]

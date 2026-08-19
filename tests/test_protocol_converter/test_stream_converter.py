@@ -1,6 +1,11 @@
 import json
 
 from src.openai_protocol_converter.stream_converter import StreamConverter
+from src.openai_protocol_converter.request_converter import (
+    _CUSTOM_TOOL_PROXY_PREFIX,
+    _NAMESPACE_TOOL_PROXY_PREFIX,
+    _encode_tool_proxy,
+)
 
 
 def _parse_events(results):
@@ -124,6 +129,101 @@ def test_tool_call_stream():
     # final arguments.done
     done_event = events[5]
     assert done_event["arguments"] == '{"city":"Beijing"}'
+
+
+def test_custom_tool_stream_uses_custom_responses_events():
+    converter = StreamConverter(response_id="resp-custom", model="kimi-k3")
+    proxy_name = _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, "shell", "exec")
+    first = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "id": "call_exec", "function": {
+            "name": proxy_name, "arguments": "{\"input\":\"ls"}}]
+    }}]}))
+    added = json.loads(first[0])
+    assert added["item"]["type"] == "custom_tool_call"
+    assert added["item"]["name"] == "exec"
+    assert "namespace" not in added["item"]
+    assert len(first) == 1
+
+    delta = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "function": {"arguments": " -la\"}"}}]
+    }}]}))
+    assert json.loads(delta[0])["type"] == "response.custom_tool_call_input.delta"
+
+    done = converter.process_event("[DONE]")
+    event_types = [json.loads(event)["type"] for event in done]
+    assert "response.custom_tool_call_input.done" in event_types
+    custom_done = next(
+        json.loads(event)["item"]
+        for event in done
+        if json.loads(event)["type"] == "response.output_item.done"
+        and json.loads(event)["item"].get("type") == "custom_tool_call"
+    )
+    assert "namespace" not in custom_done
+    completed = json.loads(done[-1])
+    custom_item = next(item for item in completed["response"]["output"] if item["type"] == "custom_tool_call")
+    assert custom_item["input"] == "ls -la"
+    assert "namespace" not in custom_item
+
+
+def test_namespaced_function_stream_restores_namespace_on_all_items():
+    converter = StreamConverter(response_id="resp-namespace", model="kimi-k3")
+    proxy_name = _encode_tool_proxy(_NAMESPACE_TOOL_PROXY_PREFIX, "collaboration", "interrupt_agent")
+    first = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "id": "call_interrupt", "function": {
+            "name": proxy_name, "arguments": "{}"}}]
+    }}]}))
+    added = json.loads(first[0])
+    assert added["item"]["type"] == "function_call"
+    assert added["item"]["name"] == "interrupt_agent"
+    assert added["item"]["namespace"] == "collaboration"
+
+    done = converter.process_event("[DONE]")
+    done_item = next(
+        json.loads(event)["item"]
+        for event in done
+        if json.loads(event)["type"] == "response.output_item.done"
+        and json.loads(event)["item"].get("type") == "function_call"
+    )
+    assert done_item["namespace"] == "collaboration"
+    completed = json.loads(done[-1])
+    output_item = next(item for item in completed["response"]["output"] if item["type"] == "function_call")
+    assert output_item["namespace"] == "collaboration"
+
+
+def test_custom_tool_input_split_before_key_does_not_emit_wrapper_delta():
+    converter = StreamConverter(response_id="resp-custom-split", model="kimi-k3")
+    proxy_name = _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, "shell", "exec")
+    first = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "id": "call_split", "function": {
+            "name": proxy_name, "arguments": "{\"inp"}}]
+    }}]}))
+    assert len(first) == 1
+
+    second = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "function": {"arguments": "ut\":\"ok\"}"}}]
+    }}]}))
+    assert json.loads(second[0])["delta"] == "ok"
+    completed = converter.process_event("[DONE]")
+    final = json.loads(completed[-1])
+    custom_item = next(item for item in final["response"]["output"] if item["type"] == "custom_tool_call")
+    assert custom_item["input"] == "ok"
+
+
+def test_custom_tool_input_escaped_characters_are_emitted_once():
+    converter = StreamConverter(response_id="resp-custom-escaped", model="kimi-k3")
+    proxy_name = _encode_tool_proxy(_CUSTOM_TOOL_PROXY_PREFIX, "shell", "exec")
+    raw_input = 'a"b\\c\nd'
+    arguments = json.dumps({"input": raw_input}, ensure_ascii=False)
+    events = converter.process_event(json.dumps({"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "id": "call_escaped", "function": {
+            "name": proxy_name, "arguments": arguments}}]
+    }}]}))
+    deltas = [json.loads(event)["delta"] for event in events if json.loads(event)["type"] == "response.custom_tool_call_input.delta"]
+    assert deltas == [raw_input]
+    completed = converter.process_event("[DONE]")
+    final = json.loads(completed[-1])
+    custom_item = next(item for item in final["response"]["output"] if item["type"] == "custom_tool_call")
+    assert custom_item["input"] == raw_input
 
 
 def test_finish_chunk_usage_mapped_into_response_completed():

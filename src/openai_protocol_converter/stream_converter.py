@@ -1,4 +1,6 @@
 """Convert chat.completions SSE stream to responses API SSE format."""
+
+import base64
 import json
 import time
 import uuid
@@ -49,6 +51,52 @@ def parse_sse_buffer(buffer: str) -> tuple[list[dict], str]:
         if event_data:
             append_event({"data": event_data})
     return events, remaining
+
+
+_CUSTOM_TOOL_PROXY_PREFIX = "__cf1_"
+_NAMESPACE_TOOL_PROXY_PREFIX = "__nf1_"
+
+
+def _decode_custom_tool_proxy(name: str) -> tuple[str, str] | None:
+    """Decode the request converter's stable custom-tool proxy name."""
+    if not isinstance(name, str) or not name.startswith(_CUSTOM_TOOL_PROXY_PREFIX):
+        return None
+    token = name[len(_CUSTOM_TOOL_PROXY_PREFIX) :]
+    try:
+        token += "=" * (-len(token) % 4)
+        namespace, tool_name = json.loads(base64.urlsafe_b64decode(token).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(namespace, str) or not isinstance(tool_name, str):
+        return None
+    return namespace, tool_name
+
+
+def _decode_namespace_tool_proxy(name: str) -> tuple[str, str] | None:
+    """Decode a namespaced function proxy name into (namespace, name)."""
+    if not isinstance(name, str) or not name.startswith(_NAMESPACE_TOOL_PROXY_PREFIX):
+        return None
+    token = name[len(_NAMESPACE_TOOL_PROXY_PREFIX) :]
+    try:
+        token += "=" * (-len(token) % 4)
+        namespace, tool_name = json.loads(base64.urlsafe_b64decode(token).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(namespace, str) or not isinstance(tool_name, str):
+        return None
+    return namespace, tool_name
+
+
+def _custom_input_from_arguments(arguments: str) -> str | None:
+    """Extract raw custom input from the Chat function JSON wrapper."""
+    try:
+        value = json.loads(arguments)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # Do not emit a delta until the complete JSON wrapper is parseable.
+        return None
+    if isinstance(value, dict) and isinstance(value.get("input"), str):
+        return value["input"]
+    return None
 
 
 class StreamConverter:
@@ -434,28 +482,53 @@ class StreamConverter:
         for index, tc in self._tool_calls.items():
             if index in self._emitted_tool_ids and tc.get("item_id"):
                 output_index = self._tool_call_output_indices.get(index, self._next_output_index)
-                # function_call_arguments.done
-                events.append(json.dumps({
-                    "type": "response.function_call_arguments.done",
-                    "item_id": tc["item_id"],
-                    "output_index": output_index,
-                    "call_id": tc.get("call_id", ""),
-                    "name": tc.get("name", ""),
-                    "arguments": tc.get("arguments", ""),
-                    "sequence_number": self._next_seq(),
-                }, separators=(",", ":")))
-                # output_item.done for function_call
-                events.append(json.dumps({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
+                if tc.get("custom"):
+                    # Responses has dedicated custom-tool input events; do not
+                    # expose the proxy as an ordinary function call.
+                    custom_input = tc.get("custom_input")
+                    if custom_input is None:
+                        custom_input = _custom_input_from_arguments(tc.get("arguments", "")) or ""
+                    events.append(json.dumps({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": tc["item_id"],
+                        "output_index": output_index,
+                        "input": custom_input,
+                        "sequence_number": self._next_seq(),
+                    }, separators=(",", ":")))
+                    done_item = {
+                        "id": tc["item_id"],
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "call_id": tc.get("call_id", ""),
+                        "name": tc.get("name", ""),
+                        "input": custom_input,
+                    }
+                else:
+                    # function_call_arguments.done
+                    events.append(json.dumps({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": tc["item_id"],
+                        "output_index": output_index,
+                        "call_id": tc.get("call_id", ""),
+                        "name": tc.get("name", ""),
+                        "arguments": tc.get("arguments", ""),
+                        "sequence_number": self._next_seq(),
+                    }, separators=(",", ":")))
+                    done_item = {
                         "id": tc["item_id"],
                         "type": "function_call",
                         "status": "completed",
                         "call_id": tc.get("call_id", ""),
                         "name": tc.get("name", ""),
                         "arguments": tc.get("arguments", ""),
-                    },
+                    }
+                if tc.get("namespace"):
+                    done_item["namespace"] = tc["namespace"]
+                # output_item.done closes either a function or custom call.
+                events.append(json.dumps({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": done_item,
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
 
@@ -482,14 +555,22 @@ class StreamConverter:
             })
         for index, tc in self._tool_calls.items():
             if tc.get("item_id"):
-                output_items.append({
+                output_item = {
                     "id": tc["item_id"],
-                    "type": "function_call",
+                    "type": "custom_tool_call" if tc.get("custom") else "function_call",
                     "status": "completed",
                     "call_id": tc.get("call_id", ""),
                     "name": tc.get("name", ""),
-                    "arguments": tc.get("arguments", ""),
-                })
+                    "input" if tc.get("custom") else "arguments": (
+                        tc.get("custom_input")
+                        if tc.get("custom_input") is not None
+                        else (_custom_input_from_arguments(tc.get("arguments", "")) or "")
+                        if tc.get("custom") else tc.get("arguments", "")
+                    ),
+                }
+                if tc.get("namespace"):
+                    output_item["namespace"] = tc["namespace"]
+                output_items.append(output_item)
 
         # response.completed
         events.append(json.dumps({
@@ -511,11 +592,17 @@ class StreamConverter:
             if index not in self._tool_calls:
                 call_id = tc.get("id", "")
                 item_id = f"fc_{call_id}" if call_id else ""
+                proxy_name = tc.get("function", {}).get("name", "")
+                custom_proxy = _decode_custom_tool_proxy(proxy_name)
+                namespace_proxy = _decode_namespace_tool_proxy(proxy_name)
                 self._tool_calls[index] = {
                     "call_id": call_id,
                     "item_id": item_id,
-                    "name": tc.get("function", {}).get("name", ""),
+                    "name": (custom_proxy or namespace_proxy or ("", proxy_name))[1],
+                    "namespace": namespace_proxy[0] if namespace_proxy and not custom_proxy else None,
+                    "custom": custom_proxy is not None,
                     "arguments": tc.get("function", {}).get("arguments", ""),
+                    "custom_input": "",
                 }
             else:
                 existing = self._tool_calls[index]
@@ -524,7 +611,11 @@ class StreamConverter:
                     existing["item_id"] = f"fc_{tc['id']}"
                 func = tc.get("function", {})
                 if func.get("name"):
-                    existing["name"] = func["name"]
+                    custom_proxy = _decode_custom_tool_proxy(func["name"])
+                    namespace_proxy = _decode_namespace_tool_proxy(func["name"])
+                    existing["name"] = (custom_proxy or namespace_proxy or ("", func["name"]))[1]
+                    existing["namespace"] = namespace_proxy[0] if namespace_proxy and not custom_proxy else None
+                    existing["custom"] = custom_proxy is not None
                 if func.get("arguments"):
                     existing["arguments"] += func["arguments"]
 
@@ -542,17 +633,30 @@ class StreamConverter:
             # Emit output_item.added on first encounter
             if index not in self._emitted_tool_call_items:
                 self._emitted_tool_call_items.add(index)
-                events.append(json.dumps({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
+                if existing.get("custom"):
+                    added_item = {
+                        "id": existing["item_id"],
+                        "type": "custom_tool_call",
+                        "status": "in_progress",
+                        "call_id": existing["call_id"],
+                        "name": existing["name"],
+                        "input": "",
+                    }
+                else:
+                    added_item = {
                         "id": existing["item_id"],
                         "type": "function_call",
                         "status": "in_progress",
                         "call_id": existing["call_id"],
                         "name": existing["name"],
                         "arguments": "",
-                    },
+                    }
+                if existing.get("namespace"):
+                    added_item["namespace"] = existing["namespace"]
+                events.append(json.dumps({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": added_item,
                     "sequence_number": self._next_seq(),
                 }, separators=(",", ":")))
 
@@ -564,13 +668,31 @@ class StreamConverter:
             func = tc.get("function", {})
             arg_delta = func.get("arguments", "") or ""
 
-            events.append(json.dumps({
-                "type": "response.function_call_arguments.delta",
-                "item_id": existing["item_id"],
-                "output_index": output_index,
-                "call_id": existing["call_id"],
-                "delta": arg_delta,
-                "sequence_number": self._next_seq(),
-            }, separators=(",", ":")))
+            if existing.get("custom"):
+                full_input = _custom_input_from_arguments(existing.get("arguments", ""))
+                if full_input is None:
+                    continue
+                previous_input = existing.get("custom_input", "")
+                input_delta = full_input[len(previous_input):] if full_input.startswith(previous_input) else full_input
+                existing["custom_input"] = full_input
+                if not input_delta:
+                    continue
+                delta_event = {
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": existing["item_id"],
+                    "output_index": output_index,
+                    "delta": input_delta,
+                    "sequence_number": self._next_seq(),
+                }
+            else:
+                delta_event = {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": existing["item_id"],
+                    "output_index": output_index,
+                    "call_id": existing["call_id"],
+                    "delta": arg_delta,
+                    "sequence_number": self._next_seq(),
+                }
+            events.append(json.dumps(delta_event, separators=(",", ":")))
 
         return events

@@ -1,4 +1,8 @@
-from src.openai_protocol_converter.request_converter import convert_request
+from src.openai_protocol_converter.request_converter import (
+    _CUSTOM_TOOL_PROXY_PREFIX,
+    _NAMESPACE_TOOL_PROXY_PREFIX,
+    convert_request,
+)
 
 
 def test_input_string_to_messages():
@@ -157,30 +161,182 @@ def test_text_format_openai_style_json_schema_rewritten_for_kimi():
 
 
 def test_tools_adaptation():
-    """Responses API format tools (flat) are converted to Chat Completions format (nested)."""
+    """Current Codex additional_tools function declarations reach Chat format."""
     req = {
-        "model": "kimi-k2.6",
-        "input": "Hello!",
-        "tools": [
+        "model": "kimi-k3",
+        "input": [{
+            "type": "additional_tools",
+            "tools": [{"type": "namespace", "name": "weather", "tools": [
             {
                 "type": "function",
                 "name": "get_weather",
                 "description": "Get weather info",
                 "parameters": {"type": "object"},
             },
-        ],
+            ]}],
+        }],
     }
     result = convert_request(req)
-    assert result["tools"] == [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather info",
-                "parameters": {"type": "object"},
+    assert len(result["tools"]) == 1
+    assert result["tools"][0]["type"] == "function"
+    assert result["tools"][0]["function"]["name"].startswith(_NAMESPACE_TOOL_PROXY_PREFIX)
+
+
+def test_additional_tools_namespaces_are_flattened_for_chat():
+    """Codex's current nested namespace tool shape must reach Kimi."""
+    req = {
+        "model": "kimi-k3",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+            {
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "shell",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "run",
+                                "description": "Run a command",
+                                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                            },
+                            {
+                                "type": "custom",
+                                "name": "exec",
+                                "description": "Execute free-form input",
+                                "format": {"type": "text"},
+                            },
+                        ],
+                    }
+                ],
             },
-        },
+        ],
+    }
+
+    result = convert_request(req)
+
+    assert len(result["tools"]) == 2
+    names = {tool["function"]["name"] for tool in result["tools"]}
+    assert any(name.startswith(_NAMESPACE_TOOL_PROXY_PREFIX) for name in names)
+    custom_name = next(name for name in names if name.startswith(_CUSTOM_TOOL_PROXY_PREFIX))
+    custom = next(tool for tool in result["tools"] if tool["function"]["name"] == custom_name)
+    assert custom["function"]["description"] == "Execute free-form input"
+    assert custom["function"]["parameters"]["required"] == ["input"]
+
+
+def test_custom_tool_history_is_converted_to_chat_tool_messages():
+    req = {
+        "model": "kimi-k3",
+        "input": [
+            {
+                "type": "additional_tools",
+                "tools": [{"type": "namespace", "name": "shell", "tools": [
+                    {"type": "custom", "name": "exec", "format": {"type": "text"}},
+                ]}],
+            },
+            {"type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "input": "ls -la"},
+            {"type": "custom_tool_call_output", "call_id": "call_exec", "output": "done"},
+        ],
+    }
+
+    result = convert_request(req)
+
+    assert result["messages"][0]["role"] == "assistant"
+    tool_call = result["messages"][0]["tool_calls"][0]
+    assert tool_call["id"] == "call_exec"
+    assert tool_call["function"]["name"].startswith(_CUSTOM_TOOL_PROXY_PREFIX)
+    assert tool_call["function"]["arguments"] == '{"input": "ls -la"}'
+    assert result["messages"][1] == {
+        "role": "tool",
+        "tool_call_id": "call_exec",
+        "content": "done",
+    }
+
+
+def test_namespace_proxy_names_are_stable_for_same_tool_names():
+    req = {
+        "model": "kimi-k3",
+        "input": [{
+            "type": "additional_tools",
+            "tools": [
+                {"type": "namespace", "name": "one", "tools": [{"type": "function", "name": "run"}]},
+                {"type": "namespace", "name": "two", "tools": [{"type": "function", "name": "run"}]},
+            ],
+        }],
+    }
+
+    first = convert_request(req)
+    second = convert_request(req)
+    first_names = [tool["function"]["name"] for tool in first["tools"]]
+    second_names = [tool["function"]["name"] for tool in second["tools"]]
+    assert first_names == second_names
+    assert len(set(first_names)) == 2
+
+
+def test_namespaced_function_call_history_uses_namespace_proxy():
+    req = {
+        "model": "kimi-k3",
+        "input": [
+            {
+                "type": "additional_tools",
+                "tools": [{"type": "namespace", "name": "collaboration", "tools": [
+                    {"type": "function", "name": "interrupt_agent"},
+                ]}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_interrupt",
+                "name": "interrupt_agent",
+                "namespace": "collaboration",
+                "arguments": "{}",
+            },
+        ],
+    }
+
+    result = convert_request(req)
+
+    function_name = result["messages"][0]["tool_calls"][0]["function"]["name"]
+    assert function_name.startswith(_NAMESPACE_TOOL_PROXY_PREFIX)
+    assert len(function_name) <= 64
+
+
+def test_real_mcp_namespace_proxy_names_fit_chat_function_limit():
+    req = {
+        "model": "kimi-k3",
+        "input": [{
+            "type": "additional_tools",
+            "tools": [{"type": "namespace", "name": "mcp__fastctx", "tools": [
+                {"type": "function", "name": "inspect_local_file"},
+                {"type": "custom", "name": "exec", "format": {"type": "text"}},
+            ]}],
+        }],
+    }
+
+    result = convert_request(req)
+
+    names = [tool["function"]["name"] for tool in result["tools"]]
+    assert names
+    assert all(len(name) <= 64 for name in names)
+
+
+def test_current_two_namespace_fixture_expands_all_seven_tools():
+    namespaces = [
+        {"type": "namespace", "name": "collaboration", "tools": [
+            {"type": "function", "name": name} for name in (
+                "spawn_agent", "send_message", "wait_agent", "list_agents", "read_agent"
+            )
+        ]},
+        {"type": "namespace", "name": "mcp__fastctx", "tools": [
+            {"type": "function", "name": "inspect_local_file"},
+            {"type": "custom", "name": "exec", "format": {"type": "text"}},
+        ]},
     ]
+    result = convert_request({
+        "model": "kimi-k3",
+        "input": [{"type": "additional_tools", "tools": namespaces}],
+    })
+    assert len(result["tools"]) == 7
 
 
 def test_empty_assistant_message_filtered():
