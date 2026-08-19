@@ -105,6 +105,46 @@ def test_k3_done_is_idempotent():
 
     first = converter.process_event("[DONE]")
     second = converter.process_event("[DONE]")
+    eof = converter.process_eof()
 
     assert _event_types(first)[-1] == "response.completed"
     assert second == []
+    assert eof == []
+
+
+def test_k3_eof_completes_terminal_stream_without_done():
+    converter = StreamConverter(response_id="resp-k3-eof", model="kimi-k3")
+    converter.process_event(json.dumps({
+        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+    }))
+    converter.process_event(json.dumps({
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        },
+    }))
+
+    eof_events = converter.process_eof()
+
+    assert _event_types(eof_events)[-1] == "response.completed"
+    assert converter.process_eof() == []
+
+
+def test_k3_eof_does_not_complete_without_terminal_evidence():
+    converter = StreamConverter(response_id="resp-k3-truncated", model="kimi-k3")
+    converter.process_event(json.dumps({
+        "choices": [{"delta": {"content": "partial"}, "finish_reason": None}],
+    }))
+
+    assert converter.process_eof() == []
+
+
+def test_k3_eof_does_not_complete_without_final_usage():
+    converter = StreamConverter(response_id="resp-k3-no-usage", model="kimi-k3")
+    converter.process_event(json.dumps({
+        "choices": [{"delta": {}, "finish_reason": "stop"}],
+    }))
+
+    assert converter.process_eof() == []

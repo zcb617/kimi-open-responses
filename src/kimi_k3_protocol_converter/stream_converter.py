@@ -129,6 +129,7 @@ class StreamConverter:
         self._completed = False
         self._message_done = False
         self._usage: dict | None = None
+        self._finish_reason: str | None = None
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -221,6 +222,9 @@ class StreamConverter:
         mapped_usage = _map_chat_usage_to_responses(choice.get("usage"))
         if mapped_usage is not None:
             self._usage = mapped_usage
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            self._finish_reason = finish_reason
         delta = choice.get("delta", {})
         content = delta.get("content")
         reasoning_content = delta.get("reasoning_content")
@@ -369,6 +373,13 @@ class StreamConverter:
                 self._message_done = True
             events.extend(self._process_tool_call_delta(tool_calls))
 
+        return events
+
+    def process_eof(self) -> list[str]:
+        """Complete a terminal K3 stream when the upstream omits [DONE]."""
+        events: list[str] = []
+        if not self._completed and self._finish_reason is not None and self._usage is not None:
+            self._emit_completion_events(events)
         return events
 
     def _emit_completion_events(self, events: list[str]) -> None:
