@@ -12,6 +12,40 @@ def _event_types(events: list[str]) -> list[str]:
     return [json.loads(event)["type"] for event in events]
 
 
+def test_k3_tool_parameters_remove_type_alongside_ref_without_mutating_input():
+    parameters = {
+        "type": "object",
+        "$defs": {
+            "__schema2": {"type": "string"},
+            "__schema20": {"$ref": "#/$defs/__schema2", "type": "string"},
+        },
+    }
+    request = {
+        "model": "kimi-k3",
+        "input": [{
+            "type": "additional_tools",
+            "tools": [{
+                "namespace": "mcp__test",
+                "tools": [{"type": "function", "name": "nested", "parameters": parameters}],
+            }],
+        }],
+        "tools": [{"type": "function", "name": "top", "parameters": parameters}],
+    }
+
+    result = convert_request(request)
+
+    top_parameters = result["tools"][0]["function"]["parameters"]
+    additional_parameters = result["tools"][1]["function"]["parameters"]
+    for normalized in (top_parameters, additional_parameters):
+        assert normalized["$defs"]["__schema20"] == {"$ref": "#/$defs/__schema2"}
+        assert normalized["$defs"]["__schema2"] == {"type": "string"}
+        assert normalized["type"] == "object"
+    assert parameters["$defs"]["__schema20"] == {
+        "$ref": "#/$defs/__schema2",
+        "type": "string",
+    }
+
+
 def test_k3_stream_request_includes_final_usage():
     result = convert_request({"model": "kimi-k3", "input": "hello", "stream": True})
 

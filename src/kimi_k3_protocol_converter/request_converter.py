@@ -50,6 +50,23 @@ def _custom_tool_parameters(tool: dict) -> dict:
     }
 
 
+def _normalize_moonshot_tool_schema(value):
+    """Recursively copy a schema and remove type beside any $ref."""
+    if isinstance(value, dict):
+        # Copy every nested value before applying the Moonshot-specific cleanup
+        # so the caller's schema, including shared sub-objects, is untouched.
+        normalized = {
+            key: _normalize_moonshot_tool_schema(item)
+            for key, item in value.items()
+        }
+        if "$ref" in normalized and "type" in normalized:
+            normalized.pop("type")
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_moonshot_tool_schema(item) for item in value]
+    return value
+
+
 def _iter_additional_tools(input_data) -> list[dict]:
     """Yield namespace tool definitions embedded in input additional_tools."""
     if not isinstance(input_data, list):
@@ -88,9 +105,12 @@ def _convert_additional_tool(tool_entry: dict) -> tuple[dict | None, str | None]
         proxy_name = _encode_tool_proxy(_NAMESPACE_TOOL_PROXY_PREFIX, namespace, name)
         function_def = {
             key: tool[key]
-            for key in ("description", "parameters", "strict")
+            for key in ("description", "strict")
             if key in tool
         }
+        if "parameters" in tool:
+            # Preserve the source key's presence while normalizing its schema.
+            function_def["parameters"] = _normalize_moonshot_tool_schema(tool["parameters"])
         function_def["name"] = proxy_name
         return {"type": "function", "function": function_def}, "function"
     if tool_type == "custom":
@@ -128,7 +148,9 @@ def _convert_top_level_tool(tool: dict) -> dict | None:
 
     function_def = {
         "name": name,
-        "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+        "parameters": _normalize_moonshot_tool_schema(
+            tool.get("parameters") or {"type": "object", "properties": {}}
+        ),
     }
     description = tool.get("description")
     if isinstance(description, str):
