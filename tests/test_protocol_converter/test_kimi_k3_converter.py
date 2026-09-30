@@ -182,3 +182,70 @@ def test_k3_eof_does_not_complete_without_final_usage():
     }))
 
     assert converter.process_eof() == []
+
+
+def test_k3_repeat_complete_tool_call_with_usage_and_done_succeeds():
+    """验证 repeat 携带完整工具调用和 usage 后通过 DONE 成功结束。"""
+    converter = StreamConverter(response_id="resp-k3-repeat-tool", model="kimi-k3")
+    proxy_name = _encode_tool_proxy(
+        _NAMESPACE_TOOL_PROXY_PREFIX,
+        "mcp__fastctx",
+        "glob",
+    )
+    converter.process_event(json.dumps({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_repeat_glob",
+                    "function": {"name": proxy_name, "arguments": "{}"},
+                }],
+            },
+            "finish_reason": "repeat",
+        }],
+    }))
+    converter.process_event(json.dumps({
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }))
+
+    done_events = converter.process_event("[DONE]")
+
+    assert _event_types(done_events)[-1] == "response.completed"
+    assert "response.failed" not in _event_types(done_events)
+    assert converter._successful is True
+
+
+def test_k3_repeat_text_with_usage_and_eof_succeeds():
+    """验证 repeat 携带文本和 usage 后通过 EOF 成功结束。"""
+    converter = StreamConverter(response_id="resp-k3-repeat-text", model="kimi-k3")
+    converter.process_event(json.dumps({
+        "choices": [{"delta": {"content": "ok"}, "finish_reason": "repeat"}],
+    }))
+    converter.process_event(json.dumps({
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }))
+
+    eof_events = converter.process_eof()
+
+    assert _event_types(eof_events)[-1] == "response.completed"
+    assert "response.failed" not in _event_types(eof_events)
+    assert converter._successful is True
+
+
+def test_k3_repeat_without_text_or_complete_tool_call_fails():
+    """验证 repeat 缺少文本和完整工具调用时仍以失败结束。"""
+    converter = StreamConverter(response_id="resp-k3-repeat-failed", model="kimi-k3")
+    converter.process_event(json.dumps({
+        "choices": [{"delta": {}, "finish_reason": "repeat"}],
+    }))
+    converter.process_event(json.dumps({
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }))
+
+    done_events = converter.process_event("[DONE]")
+
+    assert _event_types(done_events)[-1] == "response.failed"
+    assert converter._successful is False

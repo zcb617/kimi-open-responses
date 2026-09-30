@@ -214,6 +214,8 @@ class StreamConverter:
         self._message_started = False
         self._next_output_index = 0
         self._completed = False
+        # 记录响应是否以成功终止，用于区分 completed 终止标志与失败终止结果。
+        self._successful = False
         self._message_done = False
         self._usage: dict | None = None
         self._finish_reason: str | None = None
@@ -394,6 +396,7 @@ class StreamConverter:
     def _emit_failure_event(self, events: list[str], reason: str) -> None:
         if self._completed:
             return
+        self._successful = False
         self._completed = True
         response = self._build_response_object(status="failed", output=[])
         response["error"] = {
@@ -420,6 +423,8 @@ class StreamConverter:
             successful = has_text
         elif finish_reason == "tool_calls":
             successful = has_tool_call
+        elif finish_reason == "repeat":
+            successful = has_text or has_tool_call
         else:
             successful = False
 
@@ -602,6 +607,7 @@ class StreamConverter:
         if self._completed:
             return
         self._completed = True
+        self._successful = True
         reasoning_text = "".join(self._reasoning_parts)
         text_content = "".join(self._text_parts)
 
